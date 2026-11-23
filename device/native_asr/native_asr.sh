@@ -8,7 +8,10 @@ PNS=/etc/init.d/pns
 AIVS=/etc/init.d/mico_aivs_lab
 TAG=NATIVE_ASR_MANAGED_V1
 log() { echo "[NATIVE-ASR] $*"; }
-is_boot1() { [ "$(awk '$2 == "/" {print $1;exit}' /proc/mounts)" = /dev/mtdblock5 ]; }
+is_boot1() {
+    case "${NATIVE_ROOT_PROFILE:-auto}" in system1) return 0 ;; system0) return 1 ;; esac
+    [ "$(awk '$2 == "/" {print $1;exit}' /proc/mounts)" = /dev/mtdblock5 ]
+}
 mounted() { awk -v p="$1" '$2==p {found=1} END {exit !found}' /proc/mounts; }
 owned() { mounted "$1" && grep -q "$TAG" "$1"; }
 hash_is() { [ "$(sha256sum "$1" 2>/dev/null | awk '{print $1}')" = "$2" ]; }

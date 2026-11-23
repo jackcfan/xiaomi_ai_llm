@@ -29,6 +29,14 @@ AIVS_GUARD_BIN=/data/aivs_speech_guard
 
 helper 缺失或配置关闭时保留原有轮询。`UNSUPPORTED_PATTERNS` 同时传给 helper 和 shell，避免两套分类规则不同。已有自定义配置需要自行合入新增的失败文案表达式。
 
+### 问答全转 LLM（`LLM_ROUTE_ALL_QA=1`）
+
+客户端开启 `LLM_ROUTE_ALL_QA=1` 时，会把 `NATIVE_KEEP_QUERY_PATTERNS`（再加上 `WAKE_IGNORE_QUERIES` 的整句匹配）作为第 7 个参数传给 helper。helper 记住最近一个 `RecognizeResult` 的 `is_final:true` 非空文本：不命中该表达式时，同一 `dialog_id` 的 `Speak` 按失败播报同样暂停，交给客户端转 LLM；命中则放行给小爱。不传该参数时行为与之前完全一致。
+
+离线验证：`guard --classify <失败表达式> <保留表达式>` 逐行输出 `block`/`pass`。2026-11-22 在 S12A system0（ROM 1.76.54，`NATIVE_ROOT_PROFILE=system1`）部署。
+
+Windows 上无本机 C 编译器时可用 `python -m pip install ziglang`，再 `python -m ziglang cc -target aarch64-linux-musl -static -Os ...` 交叉编译；单测需在 Linux/WSL 中提供 `cc`。
+
 ## 恢复与边界
 
 LLM 回答文本不送入本拦截器；LLM 请求及播报期间，busy 标记使拦截条件不成立，包括原生 TTS 降级的正常流程。

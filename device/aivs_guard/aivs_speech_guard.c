@@ -104,15 +104,35 @@ static const char *member(const char *p, const char *key) {
 static int value(const char *obj, const char *key, char *out, size_t cap) {
     const char *p = member(obj,key); return p && string(p,out,cap);
 }
-static int classify(const char *line, regex_t *pattern) {
+/* Route-all-QA state: the newest dialog whose final ASR text did not match the
+ * keep-native pattern. Its Speak is paused like a failure reply, so the client
+ * can hand the question to the LLM before the native answer is audible. */
+static char llm_dialog[128];
+static void note_final_query(const char *header, const char *payload, const char *dialog, regex_t *keep) {
+    char name[128], ns[128], text[4096];
+    const char *p;
+    if (!keep || !value(header,"name",name,sizeof name) || strcmp(name,"RecognizeResult") ||
+        !value(header,"namespace",ns,sizeof ns) || strcmp(ns,"SpeechRecognizer")) return;
+    p = member(payload,"is_final");
+    if (!p || strncmp(p,"true",4)) return;
+    p = member(payload,"results");
+    if (!p || *p != '[') return;
+    p = space(p + 1);
+    if (!value(p,"text",text,sizeof text) || !*text) return;
+    if (regexec(keep,text,0,NULL,0) == 0) { if (!strcmp(llm_dialog,dialog)) llm_dialog[0] = 0; return; }
+    snprintf(llm_dialog,sizeof llm_dialog,"%s",dialog);
+}
+static int classify(const char *line, regex_t *pattern, regex_t *keep) {
     char name[128], ns[128], dialog[128], text[32768];
     const char *end = skip(line,0);
     if (!end || *space(end)) return 0;
     const char *header = member(line,"header"), *payload = member(line,"payload");
-    if (!header || !payload || !value(header,"name",name,sizeof name) || strcmp(name,"Speak") ||
+    if (!header || !payload || !value(header,"dialog_id",dialog,sizeof dialog) || !*dialog) return 0;
+    note_final_query(header,payload,dialog,keep);
+    if (!value(header,"name",name,sizeof name) || strcmp(name,"Speak") ||
         !value(header,"namespace",ns,sizeof ns) || strcmp(ns,"SpeechSynthesizer") ||
-        !value(header,"dialog_id",dialog,sizeof dialog) || !*dialog ||
         !value(payload,"text",text,sizeof text)) return 0;
+    if (keep && !strcmp(dialog,llm_dialog)) return 1;
     return regexec(pattern,text,0,NULL,0) == 0;
 }
 static double monotonic(void) {
@@ -140,14 +160,23 @@ static void release(const char *marker, const char *token, pid_t player) {
     unlink(marker); fprintf(stderr,"GUARD_RELEASE reason=unclaimed_or_exit\n");
 }
 int main(int argc, char **argv) {
-    if (argc != 3 && argc != 7) { fprintf(stderr,"usage: guard --classify regex | guard log marker busy owner_pid regex enable_marker\n"); return 2; }
-    regex_t pattern;
-    if (regcomp(&pattern,argc==3?argv[2]:argv[5],REG_EXTENDED|REG_NOSUB)) return 2;
-    if (argc==3) {
+    if (argc < 3 || argc > 8 || argc == 5 || argc == 6) {
+        fprintf(stderr,"usage: guard --classify regex [keep_regex] | guard log marker busy owner_pid regex enable_marker [keep_regex]\n");
+        return 2;
+    }
+    int classify_mode = argc <= 4;
+    regex_t pattern, keep_re, *keep = NULL;
+    if (regcomp(&pattern,classify_mode?argv[2]:argv[5],REG_EXTENDED|REG_NOSUB)) return 2;
+    const char *keep_src = classify_mode ? (argc==4?argv[3]:NULL) : (argc==8?argv[7]:NULL);
+    if (keep_src && *keep_src) {
+        if (regcomp(&keep_re,keep_src,REG_EXTENDED|REG_NOSUB)) { regfree(&pattern); return 2; }
+        keep = &keep_re;
+    }
+    if (classify_mode) {
         if (strcmp(argv[1],"--classify")) return 2;
         char *line=NULL; size_t cap=0;
-        while (getline(&line,&cap,stdin)>0) puts(classify(line,&pattern)?"block":"pass");
-        free(line); regfree(&pattern); return 0;
+        while (getline(&line,&cap,stdin)>0) puts(classify(line,&pattern,keep)?"block":"pass");
+        free(line); regfree(&pattern); if (keep) regfree(keep); return 0;
     }
     pid_t owner=(pid_t)atoi(argv[4]); if (owner<=1) return 2;
     signal(SIGTERM,stop_guard); signal(SIGINT,stop_guard);
@@ -155,7 +184,7 @@ int main(int argc, char **argv) {
     char token[128], line[65536]; size_t used=0; int drop=0, initial=1;
     snprintf(token,sizeof token,"guard:%ld\n",(long)getpid());
     double deadline=0; pid_t stopped=0;
-    fprintf(stderr,"GUARD_READY poll_ms=10 lease_seconds=3\n");
+    fprintf(stderr,"GUARD_READY poll_ms=10 lease_seconds=3 route_all_qa=%d\n",keep!=NULL);
     while (running && (kill(owner,0)==0 || errno==EPERM)) {
         if (deadline && (!owned(argv[2],token) || monotonic()>=deadline)) {
             release(argv[2],token,stopped); deadline=0; stopped=0;
@@ -172,8 +201,10 @@ int main(int argc, char **argv) {
                 while ((c=fgetc(f))!=EOF) {
                     if (c=='\n') {
                         line[used]=0;
-                        if (!drop && access(argv[6],F_OK)==0 && access(argv[3],F_OK)!=0 &&
-                            access(argv[2],F_OK)!=0 && classify(line,&pattern)) {
+                        /* Classify every line: the final ASR record that sets the
+                         * route-all-QA dialog can precede the think-armed marker. */
+                        if (!drop && classify(line,&pattern,keep) && access(argv[6],F_OK)==0 &&
+                            access(argv[3],F_OK)!=0 && access(argv[2],F_OK)!=0) {
                             pid_t pid=player_pid();
                             FILE *marker=pid>1?fopen(argv[2],"wx"):NULL;
                             if (marker) {
@@ -194,5 +225,5 @@ int main(int argc, char **argv) {
     }
     release(argv[2],token,stopped);
     if (f) fclose(f);
-    regfree(&pattern); return 0;
+    regfree(&pattern); if (keep) regfree(keep); return 0;
 }

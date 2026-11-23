@@ -9,7 +9,10 @@ RING=/tmp/native_followup_pcm.ring
 TAG=NATIVE_PCM_TAP_MANAGED_V1
 
 log() { echo "[PCM-TAP] $*"; }
-is_boot1() { [ "$(awk '$2 == "/" {print $1; exit}' /proc/mounts)" = /dev/mtdblock5 ]; }
+is_boot1() {
+    case "${NATIVE_ROOT_PROFILE:-auto}" in system1) return 0 ;; system0) return 1 ;; esac
+    [ "$(awk '$2 == "/" {print $1; exit}' /proc/mounts)" = /dev/mtdblock5 ]
+}
 mounted() { awk '$2 == "/etc/init.d/pns" {found=1} END {exit !found}' /proc/mounts; }
 owned() { mounted && grep -q "$TAG" "$PNS"; }
 hash_is() { [ "$(sha256sum "$1" 2>/dev/null | awk '{print $1}')" = "$2" ]; }

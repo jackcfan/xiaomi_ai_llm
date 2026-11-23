@@ -18,6 +18,11 @@ venv/
 .env.*
 !.env.example
 
+# hub 本地数据库（含 API key）
+hub.db
+hub.db-*
+hub-data/
+
 # 运行日志和临时文件
 *.log
 *.pid
@@ -47,3 +52,5 @@ skills-lock.json
 
 # Private on-device backups (configuration, credentials, runtime assets).
 /backups/
+.idea
+.tmp-uart

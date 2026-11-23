@@ -11,6 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PATTERN = re.search(r'^UNSUPPORTED_PATTERNS="(.*)"$',
                     (ROOT / 'device/native_first.env.example').read_text(), re.M).group(1)
+KEEP = re.search(r'^NATIVE_KEEP_QUERY_PATTERNS="\$\{NATIVE_KEEP_QUERY_PATTERNS:-(.*)\}"$',
+                 (ROOT / 'device/native_first_client.sh').read_text(encoding='utf-8'), re.M).group(1)
 FAILURE_VARIANTS = [
     '这个我暂时还回答不上诶，我要再学习学习',
     '这可把我难住了，看来要更努力学习了',
@@ -130,6 +132,45 @@ int main(int argc, char **argv) {
                 json.dumps(self.record('quoted "unknown answer"'))]
         self.assertEqual(self.classify(rows, '未知答案|unknown answer'), ['block', 'block'])
         self.assertEqual(self.classify(rows, '^不支持$'), ['pass', 'pass'])
+
+    def final(self, text, dialog='test', is_final=True):
+        return json.dumps({'header': {'dialog_id': dialog, 'name': 'RecognizeResult',
+                                      'namespace': 'SpeechRecognizer'},
+                           'payload': {'is_final': is_final, 'is_vad_begin': True,
+                                       'results': [{'confidence': 0.0, 'text': text}]}},
+                          ensure_ascii=False)
+
+    def classify_route(self, rows, keep=KEEP):
+        result = subprocess.run([str(self.bin), '--classify', PATTERN, keep],
+                                input='\n'.join(rows) + '\n', text=True,
+                                capture_output=True, check=True, timeout=5)
+        return result.stdout.splitlines()
+
+    def test_route_all_qa_blocks_native_answer_to_question(self):
+        speak = json.dumps(self.record('世界首富是马斯克'), ensure_ascii=False)
+        self.assertEqual(self.classify_route([self.final('世界首富是谁'), speak]),
+                         ['pass', 'block'])
+
+    def test_route_all_qa_keeps_native_skills(self):
+        for query in ('现在几点', '明天天气怎么样', '播放新闻', '音量调到五十', '打开客厅的灯'):
+            speak = json.dumps(self.record('好的'), ensure_ascii=False)
+            self.assertEqual(self.classify_route([self.final(query), speak]), ['pass', 'pass'], query)
+
+    def test_route_all_qa_is_dialog_scoped_and_needs_final_text(self):
+        speak_other = json.dumps(self.record('答案', dialog_id='other'), ensure_ascii=False)
+        speak = json.dumps(self.record('答案'), ensure_ascii=False)
+        self.assertEqual(self.classify_route([self.final('世界首富是谁'), speak_other]), ['pass', 'pass'])
+        self.assertEqual(self.classify_route([self.final('世界首富是谁', is_final=False), speak]),
+                         ['pass', 'pass'])
+        self.assertEqual(self.classify_route([self.final(''), speak]), ['pass', 'pass'])
+        # A later keep-native final for the same dialog cancels the LLM route.
+        self.assertEqual(self.classify_route([self.final('世界首富是谁'), self.final('现在几点'), speak]),
+                         ['pass', 'pass', 'pass'])
+
+    def test_without_keep_regex_behaviour_is_unchanged(self):
+        speak = json.dumps(self.record('世界首富是马斯克'), ensure_ascii=False)
+        self.assertEqual(self.classify([self.final('世界首富是谁'), speak]), ['pass', 'pass'])
+
 
 
 if __name__ == '__main__':

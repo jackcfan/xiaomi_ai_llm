@@ -1,0 +1,49 @@
+services:
+  xiaomi-tts:
+    build: .
+    image: xiaomi-ai-llm-server:latest
+    container_name: xiaomi-tts
+    restart: unless-stopped
+    ports:
+      # 宿主端口:容器端口。设备端 TTS_SERVER 指向 http://<NAS_IP>:<宿主端口>
+      - "8080:8080"
+    environment:
+      # 无需在此填写任何密钥：音箱自己直连 LLM，这里只做文本转语音。
+      # 如需改为服务端代调 LLM，把设备端 LLM_PIPELINE 设为 server，
+      # 再取消下面两行注释并去掉 Dockerfile 里的 --mode tts-only。
+      # DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+      # XIAOMI_SERVER_MODE: "full"
+      TZ: Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/docs', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  hub:
+    # 与 xiaomi-tts 共用同一镜像（已含 ffmpeg、server/ 与 hub/），只覆盖启动命令
+    build: .
+    image: xiaomi-ai-llm-server:latest
+    container_name: xiaomi-hub
+    restart: unless-stopped
+    command: ["python", "-m", "hub"]
+    ports:
+      # 设备端与后台都访问 http://<NAS_IP>:9999（后台 /admin，仅限局域网）
+      - "9999:9999"
+    volumes:
+      # hub.db（含 API key、历史、设置）持久化到项目目录下 hub-data/
+      - ./hub-data:/data
+    environment:
+      HUB_DB: /data/hub.db
+      HUB_PORT: "9999"
+      TZ: Asia/Shanghai
+      PYTHONIOENCODING: utf-8
+      # 仅首次建库时用于播种默认 DeepSeek 服务商；之后以后台配置为准，可留空
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

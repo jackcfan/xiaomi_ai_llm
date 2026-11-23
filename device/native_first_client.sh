@@ -22,6 +22,11 @@ EVENT_FIFO="/tmp/native_first_event.fifo"
 EVENT_LOG="/tmp/native_first_events.log"
 PLAYER_FROZEN_MARKER="/tmp/native_first_player_frozen"
 BUSY_MARKER="/tmp/native_first_busy"
+# Barge-in: a native wake word during LLM answer playback stops the answer.
+# The wakeup hook kills the answer's curl/aplay/ettsc and drops this marker.
+LLM_BARGE_IN="${LLM_BARGE_IN:-1}"
+LLM_PLAYING_MARKER="/tmp/native_first_llm_playing"
+LLM_BARGE_MARKER="/tmp/native_first_llm_barge"
 LAST_LLM_QUERY_FILE="/tmp/native_first_last_llm_query"
 LAST_LLM_TS_FILE="/tmp/native_first_last_llm_ts"
 LOG_FILE="${LOG_FILE:-/tmp/native_first_client.log}"
@@ -31,6 +36,14 @@ HOOK_WAKEUP="/tmp/wakeup.sh.native_first_client"
 MIPNS_CONF="${MIPNS_CONF:-/usr/share/xiaomi/xaudio_engine.conf}"
 MIPNS_ARGS="${MIPNS_ARGS:--r opus32 -l}"
 AUDIO_CAPTURE_SETUP="${AUDIO_CAPTURE_SETUP:-auto}"
+# Which native audio profile to use: auto (system1 iff / is /dev/mtdblock5),
+# system1 (pristine native path) or system0 (dsnoop/libxaudio overlay). Devices
+# whose two rootfs carry the same ROM should use system1 on both partitions.
+NATIVE_ROOT_PROFILE="${NATIVE_ROOT_PROFILE:-auto}"
+export NATIVE_ROOT_PROFILE
+# Candidate offsets of the "default" capture PCM name inside libxaudio_engine.so.
+# 700428: original reference device; 1005120: S12A ROM 1.76.53/1.76.54.
+XAUDIO_PATCH_OFFSETS="${XAUDIO_PATCH_OFFSETS:-700428 1005120}"
 NATIVE_RESULT_SOURCE="${NATIVE_RESULT_SOURCE:-auto}"
 NATIVE_AIVS_LAB_RESULT_SYSTEM1="${NATIVE_AIVS_LAB_RESULT_SYSTEM1:-1}"
 SYSTEM1_NATIVE_WAIT_SECONDS="${SYSTEM1_NATIVE_WAIT_SECONDS:-3}"
@@ -123,6 +136,11 @@ STREAM_TIMEOUT="${STREAM_TIMEOUT:-180}"
 UNSUPPORTED_PATTERNS="${UNSUPPORTED_PATTERNS:-暂时|不会|不支持|回答不上|需要再学习|没听懂|不知道|不会这项技能|难住|问住|更努力学习|还在学习|我.*(再|多|继续|努力)(学习|学学)|没找到.*(为你推荐其他|的新闻)}"
 # Match the invocation, not device names in native volume/playback commands.
 DIRECT_LLM_QUERY_PATTERNS="${DIRECT_LLM_QUERY_PATTERNS:-DEEPSEEK|DeepSeek|deepseek}"
+# LLM_ROUTE_ALL_QA=1: hand every final query to the LLM unless it matches
+# NATIVE_KEEP_QUERY_PATTERNS (device control, time, weather, playback, alarms...).
+# Used where the native NLP domain is not observable (S12A aivs_lab path).
+LLM_ROUTE_ALL_QA="${LLM_ROUTE_ALL_QA:-0}"
+NATIVE_KEEP_QUERY_PATTERNS="${NATIVE_KEEP_QUERY_PATTERNS:-几点|时间|日期|几号|星期|周几|礼拜|天气|气温|温度|几度|下雨|下雪|刮风|空气|雾霾|闹钟|提醒|定时|倒计时|叫醒|音量|声音|大声|小声|大点|小点|静音|暂停|继续|停止|停下|别说了|退出|播放|放一|放首|放个|来一首|来首|听|歌|音乐|电台|广播|新闻|故事|相声|有声|上一|下一|切歌|换一|单曲|循环|随机|打开|关闭|关掉|开灯|关灯|灯|空调|窗帘|插座|开关|扫地|电视|风扇|加湿|净化|热水器|调到|调高|调低|调成|设置|亮度|模式|蓝牙|夜间|勿扰|晚安|早安}"
 DIRECT_DEEPSEEK_WAKE_PATTERN='^(小爱同学[，, ]*)?((呼叫|召唤|问问|问一下|请|让)[ ]*[Dd][Ee][Ee][Pp][Ss][Ee][Ee][Kk]|[Dd][Ee][Ee][Pp][Ss][Ee][Ee][Kk]([ ，,：:]|搜|查|讲|说|帮|给|介绍|解释|回答|分析|告诉|$))'
 
 # --- 音箱端直连 LLM（独立链路，不依赖 Mac 调 LLM）---
@@ -753,6 +771,10 @@ root_device() {
 }
 
 is_system1_root() {
+    case "$NATIVE_ROOT_PROFILE" in
+        system1) return 0 ;;
+        system0) return 1 ;;
+    esac
     [ "$(root_device)" = "/dev/mtdblock5" ]
 }
 
@@ -810,6 +832,17 @@ apply_system_defaults() {
     fi
 }
 
+find_xaudio_patch_offset() {
+    local lib="$1" off
+    for off in $XAUDIO_PATCH_OFFSETS; do
+        if [ "$(tail -c +$((off + 1)) "$lib" 2>/dev/null | head -c 8 | tr '\000' '@')" = "default@" ]; then
+            echo "$off"
+            return 0
+        fi
+    done
+    return 1
+}
+
 setup_dsnoop() {
     if [ -f /tmp/dsnoop_ready ] && grep -q 'pcm.Capture' /etc/asound.conf 2>/dev/null; then
         return 0
@@ -854,11 +887,21 @@ ALSAEOF
     mount --bind /tmp/asound_new.conf /etc/asound.conf 2>/dev/null
 
     if [ ! -f /tmp/libxaudio_engine_patched.so ]; then
-        cp /usr/lib/libxaudio_engine.so /tmp/libxaudio_engine_patched.so
-        echo -n -e 'noop\x00\x00' | dd of=/tmp/libxaudio_engine_patched.so \
-            bs=1 count=6 seek=700428 conv=notrunc 2>/dev/null
+        local patch_off
+        patch_off="$(find_xaudio_patch_offset /usr/lib/libxaudio_engine.so)"
+        if [ -n "$patch_off" ]; then
+            cp /usr/lib/libxaudio_engine.so /tmp/libxaudio_engine_patched.so
+            echo -n -e 'noop\x00\x00' | dd of=/tmp/libxaudio_engine_patched.so \
+                bs=1 count=6 seek="$patch_off" conv=notrunc 2>/dev/null
+            log "[SETUP] libxaudio_engine.so 补丁偏移 $patch_off"
+        else
+            # Writing at a wrong offset corrupts machine code and breaks native
+            # recording entirely, so leave the library untouched instead.
+            log "[SETUP] libxaudio_engine.so 未在 XAUDIO_PATCH_OFFSETS=$XAUDIO_PATCH_OFFSETS 找到 'default'，跳过补丁"
+        fi
     fi
-    mount --bind /tmp/libxaudio_engine_patched.so /usr/lib/libxaudio_engine.so 2>/dev/null
+    [ -f /tmp/libxaudio_engine_patched.so ] &&
+        mount --bind /tmp/libxaudio_engine_patched.so /usr/lib/libxaudio_engine.so 2>/dev/null
 
     for pid in $(pidof mipns-xiaomi 2>/dev/null); do
         kill -9 "$pid" 2>/dev/null
@@ -1040,6 +1083,56 @@ BUSY_MARKER="${BUSY_MARKER:-/tmp/native_first_busy}"
 NATIVE_REPLAY_CANCEL_MARKER="${NATIVE_REPLAY_CANCEL_MARKER:-/tmp/native_first_replay_cancel}"
 FREEZE_NATIVE_PLAYER_ON_THINK="${FREEZE_NATIVE_PLAYER_ON_THINK:-1}"
 WAKE_ON_THINK_SYSTEM1="${WAKE_ON_THINK_SYSTEM1:-1}"
+NATIVE_ROOT_PROFILE="${NATIVE_ROOT_PROFILE:-auto}"
+LLM_BARGE_IN="${LLM_BARGE_IN:-1}"
+LLM_PLAYING_MARKER="/tmp/native_first_llm_playing"
+LLM_BARGE_MARKER="/tmp/native_first_llm_barge"
+# Stop the LLM answer: kill curl/aplay/ettsc descended from the client.
+hook_barge_in() {
+    local root c pid ppid comm line hop killed=""
+    read -r root 2>/dev/null < "$LLM_PLAYING_MARKER" || return 1
+    case "$root" in ''|*[!0-9]*) return 1 ;; esac
+    kill -0 "$root" 2>/dev/null || return 1
+    : > "$LLM_BARGE_MARKER"
+    # One pass: only curl/aplay/ettsc candidates, then walk their parents.
+    for c in /proc/[0-9]*/comm; do
+        read -r comm 2>/dev/null < "$c" || continue
+        case "$comm" in curl|aplay|ettsc) ;; *) continue ;; esac
+        pid=${c#/proc/}; pid=${pid%/comm}
+        ppid=$pid hop=0
+        while [ "$hop" -lt 12 ]; do
+            read -r line 2>/dev/null < "/proc/$ppid/stat" || break
+            line=${line##*) }
+            set -- $line
+            ppid=$2
+            [ "$ppid" -gt 1 ] 2>/dev/null || break
+            if [ "$ppid" = "$root" ]; then
+                kill "$pid" 2>/dev/null && killed="$killed $comm:$pid"
+                break
+            fi
+            hop=$((hop + 1))
+        done
+    done
+    # Native starts the new dialog right now; it must not find the player
+    # frozen. Drop the stale (guard-paused) answer from its queue while muted.
+    if [ -f "$PLAYER_FROZEN_MARKER" ]; then
+        amixer -c 0 sset 'Hard Mute' on >/dev/null 2>&1
+        killall -CONT mediaplayer 2>/dev/null
+        ubus -t 1 call mediaplayer player_play_operation '{"action":"stop"}' >/dev/null 2>&1
+        ubus -t 1 call mediaplayer player_reset '{}' >/dev/null 2>&1
+        amixer -c 0 sset 'Hard Mute' off >/dev/null 2>&1
+        rm -f "$PLAYER_FROZEN_MARKER"
+    fi
+    echo "[$(log_ts)] LLM_BARGE_IN killed=${killed:-none}" >> "$EVENT_LOG"
+    return 0
+}
+hook_is_system1_root() {
+    case "$NATIVE_ROOT_PROFILE" in
+        system1) return 0 ;;
+        system0) return 1 ;;
+    esac
+    [ "$(awk '$2 == "/" {print $1; exit}' /proc/mounts 2>/dev/null)" = /dev/mtdblock5 ]
+}
 AIVS_GUARD_ENABLED="${AIVS_GUARD_ENABLED:-1}"
 AIVS_GUARD_ARMED="/tmp/native_first_aivs_guard_armed"
 LED_FEEDBACK_ENABLED="${LED_FEEDBACK_ENABLED:-1}"
@@ -1076,7 +1169,7 @@ echo "[$(log_ts)] wakeup.sh $*" >> "$EVENT_LOG"
 # Busy also covers LLM PCM playback, during which physical native wake/control
 # must remain available. Only a live ASR-only lease owns these native cues.
 if [ "${SYSTEM1_FOLLOWUP_RECORD_MODE:-}" = "native_live" ] && [ -f "$BUSY_MARKER" ] &&
-    [ "$(awk '$2 == "/" {print $1;exit}' /proc/mounts)" = /dev/mtdblock5 ] &&
+    hook_is_system1_root &&
     "${NATIVE_ASR_CTL:-/data/native_asr_ctl}" status 2>/dev/null | grep -Eq 'phase=[1-6] '; then
     case "$1" in
         WuW|WuW_first|WuW_oneshot|wuw_tips|bf|bf_end|ready|ready_delay|noangle|noangle_end|think|speek|multirounds|command_timeout|mibrain_service_timeout)
@@ -1127,7 +1220,11 @@ case "$1" in
             echo "[$(log_ts)] NATIVE_REPLAY_CANCEL_ON_WAKE args=$* ts=$ts" >> "$EVENT_LOG"
         fi
         if [ -f "$BUSY_MARKER" ]; then
-            echo "[$(log_ts)] NATIVE_WAKE_IGNORED_BUSY args=$* ts=$ts" >> "$EVENT_LOG"
+            if [ "$LLM_BARGE_IN" = 1 ] && [ -f "$LLM_PLAYING_MARKER" ] && hook_barge_in; then
+                echo "[$(log_ts)] NATIVE_WAKE_BARGE_IN args=$* ts=$ts" >> "$EVENT_LOG"
+            else
+                echo "[$(log_ts)] NATIVE_WAKE_IGNORED_BUSY args=$* ts=$ts" >> "$EVENT_LOG"
+            fi
         elif [ -p "$EVENT_FIFO" ]; then
             ( echo "WuW $ts" > "$EVENT_FIFO" 2>/dev/null ) &
         fi
@@ -1136,18 +1233,29 @@ case "$1" in
     think)
         ts=$(date +%s)
         echo "[$(log_ts)] NATIVE_WAKE_EVENT args=$* ts=$ts" >> "$EVENT_LOG"
-        if [ -f "$BUSY_MARKER" ]; then
+        if [ -f "$BUSY_MARKER" ] && [ "$LLM_BARGE_IN" = 1 ] && [ -f "$LLM_PLAYING_MARKER" ] && hook_barge_in; then
+            echo "[$(log_ts)] NATIVE_THINK_BARGE_IN args=$* ts=$ts" >> "$EVENT_LOG"
+            # Hand this wake to the client once it has released the answer.
+            if hook_is_system1_root && [ -p "$EVENT_FIFO" ]; then
+                (
+                    i=0
+                    while [ -f "$BUSY_MARKER" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+                    [ "$AIVS_GUARD_ENABLED" != "1" ] || touch "$AIVS_GUARD_ARMED"
+                    echo "think $ts ${event_ms:--} $physical_ms" > "$EVENT_FIFO" 2>/dev/null
+                ) &
+            fi
+        elif [ -f "$BUSY_MARKER" ]; then
             echo "[$(log_ts)] NATIVE_THINK_IGNORED_BUSY args=$*" >> "$EVENT_LOG"
         else
             root_dev=$(awk '$2 == "/" {print $1; exit}' /proc/mounts 2>/dev/null)
-            if [ "$AIVS_GUARD_ENABLED" = "1" ] && [ "$root_dev" = "/dev/mtdblock5" ]; then
+            if [ "$AIVS_GUARD_ENABLED" = "1" ] && hook_is_system1_root; then
                 touch "$AIVS_GUARD_ARMED"
             fi
-            if [ "$WAKE_ON_THINK_SYSTEM1" = "1" ] && [ "$root_dev" = "/dev/mtdblock5" ] && [ -p "$EVENT_FIFO" ]; then
+            if [ "$WAKE_ON_THINK_SYSTEM1" = "1" ] && hook_is_system1_root && [ -p "$EVENT_FIFO" ]; then
                 ( echo "think $ts ${event_ms:--} $physical_ms" > "$EVENT_FIFO" 2>/dev/null ) &
                 echo "[$(log_ts)] NATIVE_WAKE_EVENT_FROM_THINK root=$root_dev ts=$ts" >> "$EVENT_LOG"
             fi
-            if [ "$root_dev" = "/dev/mtdblock5" ]; then
+            if hook_is_system1_root; then
                 echo "[$(log_ts)] NATIVE_PRE_FREEZE_SKIP_SYSTEM1 args=$*" >> "$EVENT_LOG"
             elif [ "$FREEZE_NATIVE_PLAYER_ON_THINK" = "1" ]; then
                 killall -STOP mediaplayer 2>/dev/null
@@ -1601,11 +1709,17 @@ start_aivs_speech_guard() {
         return 0
     fi
     rm -f "$AIVS_GUARD_ARMED"
+    local guard_keep="" guard_mode="failure Speak only"
+    if [ "$LLM_ROUTE_ALL_QA" = 1 ]; then
+        # Wake-only phrases are ignored by the client, so keep their native reply.
+        guard_keep="$NATIVE_KEEP_QUERY_PATTERNS|^($(printf '%s' "$WAKE_IGNORE_QUERIES" | tr -s ' ' '|'))$"
+        guard_mode="failure Speak + route-all-QA Speak"
+    fi
     "$AIVS_GUARD_BIN" "$AIVS_LAB_INSTRUCTION_LOG" "$PLAYER_FROZEN_MARKER" \
-        "$BUSY_MARKER" "$$" "$UNSUPPORTED_PATTERNS" "$AIVS_GUARD_ARMED" \
+        "$BUSY_MARKER" "$$" "$UNSUPPORTED_PATTERNS" "$AIVS_GUARD_ARMED" ${guard_keep:+"$guard_keep"} \
         >>/tmp/native_first_aivs_guard.log 2>&1 &
     AIVS_GUARD_PID=$!
-    log "[GUARD] started pid=$AIVS_GUARD_PID; failure Speak only, 3s unclaimed lease"
+    log "[GUARD] started pid=$AIVS_GUARD_PID; $guard_mode, 3s unclaimed lease"
 }
 
 stop_aivs_speech_guard() {
@@ -1682,10 +1796,12 @@ endpoint_denial_allows() {
 
 direct_llm_query() {
     if printf '%s\n' "$1" | grep -qi deepseek; then
-        printf '%s\n' "$1" | grep -Eq "${DIRECT_DEEPSEEK_WAKE_PATTERN:-$DIRECT_LLM_QUERY_PATTERNS}"
+        printf '%s\n' "$1" | grep -Eq "${DIRECT_DEEPSEEK_WAKE_PATTERN:-$DIRECT_LLM_QUERY_PATTERNS}" && return 0
     else
-        printf '%s\n' "$1" | grep -Eq "$DIRECT_LLM_QUERY_PATTERNS"
+        printf '%s\n' "$1" | grep -Eq "$DIRECT_LLM_QUERY_PATTERNS" && return 0
     fi
+    [ "$LLM_ROUTE_ALL_QA" = 1 ] || return 1
+    ! printf '%s\n' "$1" | grep -Eq "$NATIVE_KEEP_QUERY_PATTERNS"
 }
 
 get_native_result_aivs_lab() {
@@ -2657,6 +2773,8 @@ tts_play_text() {
         "${TTS_SERVER}/api/v1/tts/stream"; then
         return 0
     fi
+    # Interrupted by a new wake: never replay the answer through native TTS.
+    [ ! -f "$LLM_BARGE_MARKER" ] || return 1
     if [ "$TTS_FALLBACK_NATIVE" = 1 ] && [ "$HTTP_STREAM_BYTES" != unknown ] && [ "$HTTP_STREAM_BYTES" -le 44 ]; then
         log "[TTS] HTTP 未交付 PCM，降级原生 mibrain"
         resume_native_player 1
@@ -4545,6 +4663,14 @@ stream_play_worker() {
         fi
     fi
     while :; do
+        if [ -f "$LLM_BARGE_MARKER" ]; then
+            # The wakeup hook already killed the player; never fall back to
+            # native TTS for the rest of an interrupted answer.
+            exec 8>&-
+            case "$ap" in ''|prewarmed) ;; *) kill "$ap" 2>/dev/null; wait "$ap" 2>/dev/null ;; esac
+            log '[TTS] 播报被新唤醒打断'
+            return 125
+        fi
         if [ "$stream_ready" = 0 ]; then
             if [ -f "$wd/stream_ready" ]; then
                 stream_ready=1
@@ -4902,6 +5028,8 @@ llm_stream_answer_and_play() {
         ' \
         | while IFS= read -r sentence; do
             [ -n "$sentence" ] || continue
+            # Barge-in: drain remaining text without synthesizing it.
+            [ ! -f "$LLM_BARGE_MARKER" ] || continue
             seq=$((seq + 1))
             n=$(printf "%04d" "$seq")
             if [ "${LATENCY_TRACE_ENABLED:-0}" = 1 ]; then
@@ -5090,11 +5218,21 @@ send_text_native() {
         if [ "$cleanup_mode" = "defer" ]; then
             start_followup_vad_prearm
         fi
+        rm -f "$LLM_BARGE_MARKER"
+        [ "$LLM_BARGE_IN" != 1 ] || echo "$$" > "$LLM_PLAYING_MARKER"
         if ! llm_stream_answer_and_play "$session_id" "$text" "$t0"; then
+            rm -f "$LLM_PLAYING_MARKER"
             [ -z "${ROUTE_BEEP_DIR:-}" ] || route_beep_end
             if [ "${LATENCY_TRACE_ENABLED:-0}" = 1 ]; then
                 latency_report
                 latency_discard
+            fi
+            if [ -f "$LLM_BARGE_MARKER" ]; then
+                rm -f "$LLM_BARGE_MARKER"
+                log "[LLM-NATIVE] 播报被新唤醒打断，交还小米原生"
+                cancel_followup_vad_prearm
+                finish_llm_playback quiet
+                return 1
             fi
             log "[LLM-NATIVE] 流式回答或播报失败，结束"
             if [ -n "${LLM_WEB_MARK_DIR:-}" ] && [ -f "$LLM_WEB_MARK_DIR/web_used" ] && [ ! -f "$LLM_WEB_MARK_DIR/failure_spoken" ]; then
@@ -5113,6 +5251,7 @@ send_text_native() {
             return 1
         fi
         t2=$(elapsed_s "$t0")
+        rm -f "$LLM_PLAYING_MARKER" "$LLM_BARGE_MARKER"
         llm_finish_answer_audio "$cleanup_mode" || return 1
         log "[LLM-NATIVE] streamed in ${t2}s (首声=${LLM_STREAM_FIRST_SOUND:-?}s llm_ttft=${LLM_DIRECT_TTFT:-?}s llm_gen=${LLM_DIRECT_GEN_S:-?}s segs=${LLM_STREAM_SEGS:-0})"
         if [ "$cleanup_mode" = "defer" ]; then
@@ -5147,13 +5286,23 @@ send_text_native() {
     if [ "$cleanup_mode" = "defer" ]; then
         start_followup_vad_prearm
     fi
+    rm -f "$LLM_BARGE_MARKER"
+    [ "$LLM_BARGE_IN" != 1 ] || echo "$$" > "$LLM_PLAYING_MARKER"
     if ! tts_play_text "$LLM_DIRECT_ANSWER"; then
-        log "[LLM-NATIVE] 播报失败，结束且不提交完整历史"
+        rm -f "$LLM_PLAYING_MARKER"
         cancel_followup_vad_prearm
+        if [ -f "$LLM_BARGE_MARKER" ]; then
+            rm -f "$LLM_BARGE_MARKER"
+            log "[LLM-NATIVE] 播报被新唤醒打断，交还小米原生"
+            finish_llm_playback quiet
+            return 1
+        fi
+        log "[LLM-NATIVE] 播报失败，结束且不提交完整历史"
         led_feedback_error
         finish_llm_playback
         return 1
     fi
+    rm -f "$LLM_PLAYING_MARKER" "$LLM_BARGE_MARKER"
     if [ ! -f "$LLM_WEB_MARK_DIR/no_history" ] && ! llm_history_commit "$session_id" "$text" "$LLM_DIRECT_ANSWER"; then
         log "[HISTORY] 完整回答未能安全保存，结束本轮"
         cancel_followup_vad_prearm
@@ -5986,7 +6135,7 @@ cleanup() {
         restore_audio_capture_overlays
     fi
     resume_native_asr
-    rm -f "$EVENT_FIFO" "$BUSY_MARKER"
+    rm -f "$EVENT_FIFO" "$BUSY_MARKER" "$LLM_PLAYING_MARKER" "$LLM_BARGE_MARKER"
     if [ -f "$PID_FILE" ] && [ "$(cat "$PID_FILE" 2>/dev/null)" = "$$" ]; then
         rm -f "$PID_FILE"
     fi

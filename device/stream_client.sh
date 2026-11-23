@@ -66,13 +66,28 @@ ALSAEOF
 
     mount --bind /tmp/asound_new.conf /etc/asound.conf 2>/dev/null
 
-    # Patch libxaudio_engine.so
+    # Patch libxaudio_engine.so: only where "default\0" actually sits.
+    # 700428: original reference device; 1005120: S12A ROM 1.76.53/1.76.54.
     if [ ! -f /tmp/libxaudio_engine_patched.so ]; then
-        cp /usr/lib/libxaudio_engine.so /tmp/libxaudio_engine_patched.so
-        echo -n -e 'noop\x00\x00' | dd of=/tmp/libxaudio_engine_patched.so \
-            bs=1 count=6 seek=700428 conv=notrunc 2>/dev/null
+        patch_off=""
+        for off in ${XAUDIO_PATCH_OFFSETS:-700428 1005120}; do
+            if [ "$(tail -c +$((off + 1)) /usr/lib/libxaudio_engine.so 2>/dev/null | head -c 8 | tr '\000' '@')" = "default@" ]; then
+                patch_off="$off"
+                break
+            fi
+        done
+        if [ -n "$patch_off" ]; then
+            cp /usr/lib/libxaudio_engine.so /tmp/libxaudio_engine_patched.so
+            echo -n -e 'noop\x00\x00' | dd of=/tmp/libxaudio_engine_patched.so \
+                bs=1 count=6 seek="$patch_off" conv=notrunc 2>/dev/null
+            log "[SETUP] libxaudio_engine.so 补丁偏移 $patch_off"
+        else
+            # A wrong offset corrupts machine code and kills native recording.
+            log "[SETUP] libxaudio_engine.so 未找到 'default'，跳过补丁"
+        fi
     fi
-    mount --bind /tmp/libxaudio_engine_patched.so /usr/lib/libxaudio_engine.so 2>/dev/null
+    [ -f /tmp/libxaudio_engine_patched.so ] &&
+        mount --bind /tmp/libxaudio_engine_patched.so /usr/lib/libxaudio_engine.so 2>/dev/null
 
     # 重启 mipns
     killall mipns-xiaomi 2>/dev/null

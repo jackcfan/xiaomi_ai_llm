@@ -1,0 +1,11 @@
+# 只把运行镜像真正需要的东西送进构建上下文
+*
+!Dockerfile
+!server/
+!hub/
+!requirements-tts.txt
+!config.yaml
+
+# server 包内的缓存不复制
+server/__pycache__/
+hub/__pycache__/
