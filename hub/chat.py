@@ -22,7 +22,7 @@ from hub.llm import ChatClient
 from hub.store import Store
 from hub.web import ground
 from server.streaming_pipeline import StreamingPipeline
-from hub.tts import edge_tts_factory
+from hub.tts import edge_tts_factory, siliconflow_tts_factory
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,9 @@ FILLER_TEXT = "搜索中，请稍等。"
 APOLOGY_TEXT = "抱歉，暂时无法回答。"
 DEFAULT_GAP_SECONDS = 300
 DEFAULT_MAX_TURNS = 10
+# TTS 引擎关键字（与 store.TTS_PROVIDERS 对应）；CosyVoice2 的 key 存 providers 表，
+# 按名/别名匹配不到时回退给当前 LLM provider（通常是 DeepSeek，其 key 是 OpenAI 兼容的）。
+SILICONFLOW_ENGINE = "siliconflow"
 # server/streaming_pipeline.StreamingPipeline.process 产出的 error 事件内容前缀：
 # 模型流失败为 "LLM: ..."，单句 TTS 失败为 "TTS: ..."。那里的文案改动时需同步这里。
 PIPELINE_LLM_ERROR = "LLM:"
@@ -91,7 +94,7 @@ class ChatService:
         self.tts_factory = tts_factory
         self.web_ground = web_ground
         self.clock = clock
-        # 垫话 PCM 缓存：(voice, speed, volume) -> PCM 块列表，避免每次搜索重复合成。
+        # 垫话 PCM 缓存：(engine, voice, speed, volume) -> PCM 块列表，避免每次搜索重复合成。
         self._filler_cache: dict[tuple, list[bytes]] = {}
 
     # --- helpers ---------------------------------------------------------
@@ -112,6 +115,29 @@ class ChatService:
             if provider is not None:
                 return provider
         return fallback
+
+    def _make_tts(self, persona: dict):
+        """按 persona 的 TTS 提供方构造客户端。
+
+        siliconflow（CosyVoice2）的 api_key 从 providers 表里按名/别名匹配
+        （key 存 providers，见需求）；模型固定为 CosyVoice2，不读 provider.model
+        （那是 LLM 模型名）。匹配不到直接报错，绝不拿其它厂商的 key 发往硅基流动。
+        """
+        engine = self.store.persona_tts_engine(persona)
+        voice = persona.get("voice") or ""
+        if engine == SILICONFLOW_ENGINE:
+            tts_provider = self.store.find_tts_provider(engine)
+            if tts_provider is None:
+                raise ChatError(
+                    "no siliconflow provider configured：请在 /admin/providers 添加"
+                    "「硅基流动」供应商（名称或别名含 siliconflow）并填 API key"
+                )
+            return siliconflow_tts_factory(
+                voice,
+                api_key=(tts_provider or {}).get("api_key") or "",
+                base_url=(tts_provider or {}).get("base_url") or "",
+            )
+        return self.tts_factory(voice)
 
     def _make_llm(self, provider: dict):
         return self.llm_factory(
@@ -135,10 +161,10 @@ class ChatService:
         # 被打断的回答可能是空串；空消息不发给模型。
         return [m for m in messages if m.get("content")]
 
-    async def _tts_pcm(self, voice: str, text: str, speed: float, volume: float) -> AsyncIterator[bytes]:
+    async def _tts_pcm(self, tts, text: str, speed: float, volume: float) -> AsyncIterator[bytes]:
         """纯 TTS：沿用 server/main.py stream_tts 的分句与校验，任何错误都抛出。"""
         pipeline = StreamingPipeline(
-            None, self.tts_factory(voice), sample_rate=SAMPLE_RATE, speed=speed, volume=volume
+            None, tts, sample_rate=SAMPLE_RATE, speed=speed, volume=volume
         )
         for sentence in pipeline._split_sync(text):
             has_audio = False
@@ -155,15 +181,15 @@ class ChatService:
             if not has_audio:
                 raise ChatError("TTS returned no audible PCM")
 
-    async def _filler_pcm(self, voice: str, speed: float, volume: float) -> list[bytes]:
+    async def _filler_pcm(self, tts, speed: float, volume: float) -> list[bytes]:
         """垫话 PCM（按音色/语速/音量缓存）；尽力而为，失败返回空列表并记日志。"""
-        key = (voice, speed, volume)
+        key = (getattr(tts, "voice", ""), speed, volume)
         cached = self._filler_cache.get(key)
         if cached is not None:
             return cached
         chunks: list[bytes] = []
         try:
-            async with contextlib.aclosing(self._tts_pcm(voice, FILLER_TEXT, speed, volume)) as audio:
+            async with contextlib.aclosing(self._tts_pcm(tts, FILLER_TEXT, speed, volume)) as audio:
                 async for pcm in audio:
                     chunks.append(pcm)
         except Exception as exc:
@@ -178,7 +204,8 @@ class ChatService:
         persona = self.store.current_persona()
         if persona is None:
             raise ChatError("no persona configured")
-        async with contextlib.aclosing(self._tts_pcm(persona["voice"], text, speed, volume)) as audio:
+        tts = self._make_tts(persona)
+        async with contextlib.aclosing(self._tts_pcm(tts, text, speed, volume)) as audio:
             async for pcm in audio:
                 yield pcm
 
@@ -209,13 +236,14 @@ class ChatService:
         self.store.add_turn(
             text, reply, provider["name"], persona["name"], kind, ts=self.clock()
         )
-        async with contextlib.aclosing(self._tts_pcm(persona["voice"], reply, speed, volume)) as audio:
+        tts = self._make_tts(persona)
+        async with contextlib.aclosing(self._tts_pcm(tts, reply, speed, volume)) as audio:
             async for pcm in audio:
                 yield pcm
 
     async def _qa(self, text, provider, persona, speed, volume) -> AsyncIterator[bytes]:
         context = self._context()
-        voice = persona["voice"]
+        tts = self._make_tts(persona)
         audio_started = False  # 已向调用方产出过任何 PCM（含垫话）
         answer_audio = False   # 模型回答本身已产出 PCM
         parts: list[str] = []
@@ -246,7 +274,7 @@ class ChatService:
             tool_wait = asyncio.ensure_future(tool_started.wait())
             await asyncio.wait({ground_task, tool_wait}, return_when=asyncio.FIRST_COMPLETED)
             if tool_started.is_set():
-                for pcm in await self._filler_pcm(voice, speed, volume):
+                for pcm in await self._filler_pcm(tts, speed, volume):
                     audio_started = True
                     yield pcm
             web = await ground_task
@@ -261,7 +289,7 @@ class ChatService:
                 message = text
 
             pipeline = StreamingPipeline(
-                llm, self.tts_factory(voice), sample_rate=SAMPLE_RATE, speed=speed, volume=volume
+                llm, tts, sample_rate=SAMPLE_RATE, speed=speed, volume=volume
             )
             events = pipeline.process(message, self._system_prompt(persona), history)
             async for event in events:
@@ -293,7 +321,7 @@ class ChatService:
                 save("", True)
                 try:
                     async with contextlib.aclosing(
-                        self._tts_pcm(voice, APOLOGY_TEXT, speed, volume)
+                        self._tts_pcm(tts, APOLOGY_TEXT, speed, volume)
                     ) as audio:
                         async for pcm in audio:
                             yield pcm

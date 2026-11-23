@@ -31,15 +31,18 @@ services:
     ports:
       # 设备端与后台都访问 http://<NAS_IP>:9999（后台 /admin，仅限局域网）
       - "9999:9999"
-    volumes:
-      # hub.db（含 API key、历史、设置）持久化到项目目录下 hub-data/
-      - ./hub-data:/data
     environment:
-      HUB_DB: /data/hub.db
+      # 配置与历史存 NAS MySQL（xiaomi_hub 库），不再挂 SQLite 卷
+      HUB_DB_HOST: "fnos.itougu.tech"
+      HUB_DB_PORT: "3306"
+      HUB_DB_NAME: "xiaomi_hub"
+      HUB_DB_USER: "xiaomi_hub_user"
+      # 密码绝不写进工程：启动时从宿主机环境变量 FN_MYSQL_PWD 传入
+      FN_MYSQL_PWD: "${FN_MYSQL_PWD:?请在宿主机设置 FN_MYSQL_PWD 后启动}"
       HUB_PORT: "9999"
       TZ: Asia/Shanghai
       PYTHONIOENCODING: utf-8
-      # 仅首次建库时用于播种默认 DeepSeek 服务商；之后以后台配置为准，可留空
+      # 仅首次建表播种默认 DeepSeek 服务商时使用；之后以后台配置为准，可留空
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9999/', timeout=3)"]

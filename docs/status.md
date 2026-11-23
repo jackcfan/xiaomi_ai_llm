@@ -1,5 +1,7 @@
 # 当前能力与验证范围
 
+**2026-11-23**：hub（NAS LLM hub，`python -m hub`）语音合成扩展为**可选的硅基流动 CosyVoice2**：每个性格新增「服务提供方」，默认仍是 EdgeTTS，选「硅基流动 CosyVoice2」时用 `personas.voice` 填 voice id，API key 存 `providers` 表（名称/别名含 `siliconflow` 的供应商），模型固定 `FunAudioLLM/CosyVoice2-0.5B`。请求 `wav`@32k 后走与 EdgeTTS 相同的 ffmpeg 响度归一化。相关 128 项单测通过（未访问真实网络/真实硅基流动服务），真实 CosyVoice2 出声与音箱响度、生产 MySQL 列迁移仍待实机验收。见[测试说明](testing/2026-11-23-hub-siliconflow-cosyvoice2.md)。
+
 **2026-11-06 · [PR #17](https://github.com/open-speaker-llm/xiaomi_ai_llm/pull/17) 已合并**：设备端流式 LLM 接管“咚咚”、搜索垫话“搜索中，请稍等。”、完整回答结束“咚”声，以及结束音后的 boot1 实时追问收音已实现；绿灯原本已有，首段垫话或正文播放时切换绿色跑马灯。PR 中有 boot1 真人复测记录，范围以该 PR 为准；boot0 同条件现场复验与长期稳定性仍待验收。开关见[配置参考](reference/configuration.md)。
 
 截至 **2026-11-02**，当前 boot1 已启用 native DeepSeek **自动联网搜索**：结合当前会话判断明确搜索、实时信息、追问及指定网页读取；稳定知识与创作等直接回答，失败固定提示。440 项主机回归通过、3 项跳过，搜索专项 16 项通过；真实音箱已验证官方 API、完整文本流、明确不联网和故障提示，以及 BusyBox 请求目录清理。服务已回到 IDLE，原生识别和判停正常；用户已反馈搜索实际使用很好用，**逐项收音、播放、连续追问与双系统验收仍待记录**。配置、版本、备份及实际操作见[联网搜索测试](testing/2026-11-02-web-search.md)。

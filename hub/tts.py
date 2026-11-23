@@ -3,7 +3,8 @@
 server/tts/edge_tts_client.EdgeTTSClient.synthesize 在协程里同步调用 ffmpeg
 （``subprocess.run``），每句都会卡住事件循环，回答期间 ``/`` 健康检查等请求都无响应。
 这里不改 server/，而是让 StreamingPipeline 调用的 ``synthesize_pcm`` 在线程中
-以独立事件循环（``asyncio.run``）执行原实现。
+以独立事件循环（``asyncio.run``）执行原实现。CosyVoice2（硅基流动）同样在
+``SiliconFlowTTSClient`` 里同步调 ffmpeg，因此也走同一个 ThreadedTTS 包装。
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 from server.tts.edge_tts_client import EdgeTTSClient
+from server.tts.siliconflow_tts import SiliconFlowTTSClient
 
 
 class ThreadedTTS:
@@ -35,5 +37,10 @@ class ThreadedTTS:
 
 
 def edge_tts_factory(voice: str) -> ThreadedTTS:
-    """ChatService 默认的 tts_factory：EdgeTTSClient + 线程执行。"""
+    """EdgeTTSClient + 线程执行。"""
     return ThreadedTTS(EdgeTTSClient(voice))
+
+
+def siliconflow_tts_factory(voice: str, api_key: str, base_url: str = "") -> ThreadedTTS:
+    """SiliconFlowTTSClient（CosyVoice2）+ 线程执行。模型固定为 CosyVoice2。"""
+    return ThreadedTTS(SiliconFlowTTSClient(voice, api_key, base_url=base_url))

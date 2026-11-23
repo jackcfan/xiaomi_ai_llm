@@ -7,3 +7,5 @@ pyyaml>=6.0.1
 python-dotenv>=1.0.0
 # hub（python -m hub）调用 LLM 与联网搜索
 httpx>=0.26.0
+# hub 生产存储：MySQL（NAS fnos.itougu.tech:3306）；密码从环境变量 FN_MYSQL_PWD 读取
+pymysql>=1.1.0

@@ -19,8 +19,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from hub.store import Store
 from server.tts.edge_tts_client import VOICES
+from server.tts.siliconflow_tts import COSYVOICE_MODEL
 
 PAGE_SIZE = 50
+# 性格的 TTS 服务提供方选项（值 → 后台显示名）。空串在表单里归一为 "edgetts"。
+TTS_ENGINE_CHOICES = (
+    ("edgetts", "EdgeTTS（微软，免费）"),
+    ("siliconflow", f"硅基流动 CosyVoice2（{COSYVOICE_MODEL}）"),
+)
 INT_SETTINGS = {"context_gap_seconds": "上下文间隔（秒）", "context_max_turns": "上下文最大轮数"}
 ID_SETTINGS = {
     "current_provider_id": ("当前模型", "providers"),
@@ -292,11 +298,18 @@ def make_admin_router(store: Store) -> APIRouter:
     def persona_form(p: dict | None) -> str:
         p = p or {}
         voice = p.get("voice") or ""
+        engine = str(p.get("tts_provider") or "").strip().lower()
+        if engine not in ("edgetts", "siliconflow"):
+            engine = "edgetts"
         opts = "".join(
             f"<option value='{_e(v)}'{' selected' if v == voice else ''}>{_e(v)}</option>"
             for v in voice_values
         )
         custom = voice if voice and voice not in voice_values else ""
+        engine_opts = "".join(
+            f"<option value='{_e(value)}'{' selected' if value == engine else ''}>{_e(label)}</option>"
+            for value, label in TTS_ENGINE_CHOICES
+        )
         return (
             "<form method='post' action='/admin/personas'>"
             "<input type='hidden' name='action' value='save'>"
@@ -304,6 +317,7 @@ def make_admin_router(store: Store) -> APIRouter:
             f"<tr><th>名称</th><td><input type='text' name='name' value='{_e(p.get('name'))}'></td></tr>"
             f"<tr><th>别名（逗号分隔）</th><td><input type='text' name='aliases' value='{_e(p.get('aliases'))}'></td></tr>"
             f"<tr><th>提示词</th><td><textarea name='prompt'>{_e(p.get('prompt'))}</textarea></td></tr>"
+            f"<tr><th>服务提供方</th><td><select name='tts_provider'>{engine_opts}</select></td></tr>"
             f"<tr><th>音色</th><td><select name='voice'>{opts}</select>"
             f"手填（优先）：<input type='text' name='voice_custom' value='{_e(custom)}'></td></tr>"
             "</table><button type='submit'>保存</button></form>"
@@ -311,9 +325,13 @@ def make_admin_router(store: Store) -> APIRouter:
 
     def personas_page(errors: list[str] | None = None, status_code: int = 200) -> HTMLResponse:
         parts = [_errors_html(errors or [])]
+        engine_labels = dict(TTS_ENGINE_CHOICES)
         for p in store.list_personas():
+            engine = str(p.get("tts_provider") or "").strip().lower()
+            engine_label = engine_labels.get(engine, engine_labels["edgetts"])
             parts.append(
-                f"<h3>{_e(p['name'])}（id {p['id']}）</h3><p>音色 {_e(p['voice'])}</p>"
+                f"<h3>{_e(p['name'])}（id {p['id']}）</h3>"
+                f"<p>{_e(engine_label)} · 音色 {_e(p['voice'])}</p>"
                 f"<details><summary>编辑</summary>{persona_form(p)}</details>"
                 f"{delete_form('/admin/personas', p['id'])}"
             )
@@ -336,6 +354,8 @@ def make_admin_router(store: Store) -> APIRouter:
         data["voice"] = (
             str(form.get("voice_custom", "")).strip() or str(form.get("voice", "")).strip()
         )
+        tts_provider = str(form.get("tts_provider", "")).strip().lower()
+        data["tts_provider"] = tts_provider if tts_provider == "siliconflow" else ""
         if not data["name"]:
             return personas_page(["名称不能为空"], 400)
         if row_id is not None:

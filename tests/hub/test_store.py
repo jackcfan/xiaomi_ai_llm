@@ -78,6 +78,65 @@ class StoreTestCase(unittest.TestCase):
         store.set_setting("current_persona_id", str(pid))
         self.assertEqual(store.current_persona()["name"], "东北")
 
+    def test_persona_tts_provider_roundtrip_and_engine(self):
+        store = self.open_store()
+        # 默认人设引擎是 edgetts（空串 → edgetts）
+        default = store.list_personas()[0]
+        self.assertEqual(store.persona_tts_engine(default), "edgetts")
+        # 写入 siliconflow 并回读
+        pid = store.upsert_persona({
+            "name": "cosy", "aliases": "", "prompt": "p",
+            "voice": "speech:sqz:test", "tts_provider": "siliconflow",
+        })
+        row = store.get_persona(pid)
+        self.assertEqual(row["tts_provider"], "siliconflow")
+        self.assertEqual(store.persona_tts_engine(row), "siliconflow")
+        # 未知值回退 edgetts
+        row["tts_provider"] = "bogus"
+        self.assertEqual(store.persona_tts_engine(row), "edgetts")
+
+    def test_find_tts_provider_by_name_and_alias(self):
+        store = self.open_store()
+        self.assertIsNone(store.find_tts_provider("siliconflow"))
+        pid = store.upsert_provider({
+            "name": "硅基流动", "aliases": "siliconflow,硅基", "base_url": "https://api.siliconflow.cn/v1",
+            "api_key": "sk-sf", "model": "deepseek-flash",
+        })
+        found = store.find_tts_provider("siliconflow")
+        self.assertIsNotNone(found)
+        self.assertEqual(found["api_key"], "sk-sf")
+        # 别名也能命中
+        self.assertEqual(store.find_tts_provider("硅基流动")["id"], pid)
+        # 大小写不敏感
+        self.assertIsNotNone(store.find_tts_provider("SiliconFlow"))
+
+    def test_migrates_personas_without_tts_provider_column(self):
+        conn = sqlite3.connect(self.path)
+        conn.executescript("""
+            CREATE TABLE providers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                aliases TEXT NOT NULL DEFAULT '', base_url TEXT NOT NULL DEFAULT '',
+                api_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+                temperature REAL, max_tokens INTEGER, extra_body TEXT
+            );
+            CREATE TABLE personas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+                aliases TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '',
+                voice TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO providers (name, base_url, api_key, model)
+                VALUES ('DeepSeek', 'https://api.deepseek.com', 'sk-old', 'deepseek-flash');
+            INSERT INTO settings (key, value) VALUES ('current_provider_id', '1');
+        """)
+        conn.commit()
+        conn.close()
+        store = self.open_store()
+        self.assertEqual(store.list_personas(), [])  # 没有 personas 行，只有迁移补列
+        # 旧库已有数据时补列不丢数据、默认 edgetts
+        cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(personas)")}
+        self.assertIn("tts_provider", cols)
+
     def test_current_falls_back_when_deleted(self):
         store = self.open_store()
         current = store.current_persona()

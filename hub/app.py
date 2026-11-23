@@ -10,10 +10,8 @@ import asyncio
 import contextlib
 import hmac
 import logging
-import os
 import struct
 import time
-from pathlib import Path
 from typing import AsyncIterator
 
 import anyio
@@ -26,8 +24,6 @@ from hub.store import Store
 
 logger = logging.getLogger(__name__)
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_DB = str(PROJECT_ROOT / "hub.db")
 MAX_DATA = 180 * SAMPLE_RATE * 2
 # 流式响应期间轮询客户端断开的间隔（秒）：越小越早停模型/TTS，越大越省 CPU。
 DISCONNECT_POLL_SECONDS = 0.25
@@ -264,7 +260,7 @@ def create_app(store: Store, service: ChatService | None = None) -> FastAPI:
 def __getattr__(name: str):
     # uvicorn hub.app:app 入口（由 python -m hub 调用）：按需创建，导入模块（测试）不创建数据库
     if name == "app":
-        application = create_app(Store(os.environ.get("HUB_DB", DEFAULT_DB)))
+        application = create_app(Store())
         globals()["app"] = application
         return application
     raise AttributeError(name)

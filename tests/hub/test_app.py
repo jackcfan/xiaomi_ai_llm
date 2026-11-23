@@ -5,6 +5,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -430,6 +431,40 @@ class HubAppTest(unittest.TestCase):
         self.assertEqual(self.tts.voices, [self.store.current_persona()["voice"]])
         self.assertEqual(self.llm.calls, [])
         self.assertEqual(self.store.recent_turns(5), [])
+
+    def test_siliconflow_persona_uses_provider_key(self):
+        # 当前人设切到 siliconflow：ChatService 应从 providers 里按名取 key 传给工厂，
+        # 而不是走默认 EdgeTTS 工厂。
+        import hub.chat as chat_mod
+
+        self.store.upsert_provider({
+            "name": "硅基流动", "aliases": "siliconflow", "base_url": "https://api.siliconflow.cn/v1",
+            "api_key": "sk-sf-9999", "model": "deepseek-flash",
+        })
+        pid = self.store.upsert_persona({
+            "name": "cosy", "aliases": "", "prompt": "p",
+            "voice": "speech:sqz:test:voice", "tts_provider": "siliconflow",
+        })
+        self.store.set_setting("current_persona_id", str(pid))
+        seen = {}
+        with mock.patch.object(chat_mod, "siliconflow_tts_factory",
+                               side_effect=lambda voice, api_key, base_url="": seen.update(
+                                   voice=voice, api_key=api_key, base_url=base_url)):
+            self.service._make_tts(self.store.current_persona())
+        self.assertEqual(seen["voice"], "speech:sqz:test:voice")
+        self.assertEqual(seen["api_key"], "sk-sf-9999")
+        self.assertEqual(seen["base_url"], "https://api.siliconflow.cn/v1")
+
+    def test_siliconflow_persona_without_provider_raises(self):
+        # providers 里没有 siliconflow 行时，明确报错，绝不拿其它厂商的 key 发往硅基流动。
+        from hub.chat import ChatError
+        pid = self.store.upsert_persona({
+            "name": "cosy", "aliases": "", "prompt": "p",
+            "voice": "speech:sqz:test:voice", "tts_provider": "siliconflow",
+        })
+        self.store.set_setting("current_persona_id", str(pid))
+        with self.assertRaises(ChatError):
+            self.service._make_tts(self.store.current_persona())
 
 
 if __name__ == "__main__":

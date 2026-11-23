@@ -233,6 +233,32 @@ class AdminTest(unittest.TestCase):
         new = [p for p in self.store.list_personas() if p["name"] == "海盗"][0]
         self.assertEqual(new["voice"], "zh-TW-HsiaoChenNeural")
 
+    def test_persona_tts_provider_saved_and_rendered(self):
+        page = self.client.get("/admin/personas").text
+        self.assertIn("硅基流动 CosyVoice2", page)  # 服务提供方选项渲染
+        resp = self.post("/admin/personas", {
+            "action": "save", "id": "", "name": "银发", "aliases": "",
+            "prompt": "沉稳", "voice_custom": "speech:sqz:test:voice",
+            "tts_provider": "siliconflow",
+        })
+        self.assertEqual(resp.status_code, 303)
+        new = [p for p in self.store.list_personas() if p["name"] == "银发"][0]
+        self.assertEqual(new["tts_provider"], "siliconflow")
+        self.assertEqual(new["voice"], "speech:sqz:test:voice")
+        # 列表页显示提供方名称
+        page = self.client.get("/admin/personas").text
+        self.assertIn("硅基流动 CosyVoice2", page)
+
+    def test_persona_tts_provider_defaults_to_edgetts(self):
+        # 不带 tts_provider 字段（旧脚本）或非法值 → edgetts
+        for tts_provider in (None, "", "bogus"):
+            data = {"action": "save", "id": "", "name": f"P{tts_provider}", "voice": "zh-CN-YunjianNeural"}
+            if tts_provider is not None:
+                data["tts_provider"] = tts_provider
+            self.assertEqual(self.post("/admin/personas", data).status_code, 303)
+        for p in self.store.list_personas():
+            self.assertEqual(p["tts_provider"], "")  # 空串（表单归一为 edgetts 存库）
+
     def test_history_pagination(self):
         for i in range(55):
             self.store.add_turn(f"问题{i:02d}", "答", "P", "默认", "qa", ts=1000 + i)

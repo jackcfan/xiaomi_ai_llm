@@ -9,7 +9,8 @@ import sys
 from pathlib import Path
 
 FFMPEG_MISSING = (
-    "EdgeTTS requires ffmpeg on PATH; install ffmpeg and verify `ffmpeg -version` before starting the hub"
+    "TTS requires ffmpeg on PATH (EdgeTTS MP3→PCM、CosyVoice2 响度归一化都要用); "
+    "install ffmpeg and verify `ffmpeg -version` before starting the hub"
 )
 
 
