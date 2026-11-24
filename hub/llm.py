@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import AsyncIterator
 
 import httpx
@@ -85,6 +86,9 @@ class ChatClient:
             "Accept": "text/event-stream",
         }
 
+        started = time.monotonic()
+        chars = 0
+        logger.info("call model=%s base_url=%s", self.model, self.base_url)
         async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
             async with client.stream("POST", url, json=payload, headers=headers) as resp:
                 if not resp.is_success:
@@ -93,7 +97,10 @@ class ChatClient:
                     if self._api_key:
                         body = body.replace(self._api_key, "***")
                     body = body[:_ERROR_BODY_LIMIT]
-                    logger.warning("LLM %s 返回 HTTP %s", self.model, resp.status_code)
+                    logger.warning(
+                        "LLM 失败 model=%s status=%s elapsed=%.0fms: %s",
+                        self.model, resp.status_code, (time.monotonic() - started) * 1000, body,
+                    )
                     raise LLMError(resp.status_code, body)
 
                 async for line in resp.aiter_lines():
@@ -102,6 +109,10 @@ class ChatClient:
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        logger.info(
+                            "done model=%s status=%s chars=%d elapsed=%.0fms",
+                            self.model, resp.status_code, chars, (time.monotonic() - started) * 1000,
+                        )
                         return
                     try:
                         chunk = json.loads(data)
@@ -114,4 +125,9 @@ class ChatClient:
                     delta = choices[0].get("delta") or {}
                     content = delta.get("content")
                     if content:
+                        chars += len(content)
                         yield content
+                logger.info(
+                    "done model=%s status=%s chars=%d elapsed=%.0fms",
+                    self.model, resp.status_code, chars, (time.monotonic() - started) * 1000,
+                )

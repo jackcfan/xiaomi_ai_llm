@@ -5,7 +5,36 @@ import sqlite3
 import tempfile
 import unittest
 
-from hub.store import Store
+from hub.store import SETTING_DESCRIPTIONS, Store
+
+# 改造前的完整旧 schema（turns 无 route/intent_key/rule_id/decision/learn_state/corrected），
+# 用于验证迁移：旧库补齐新列、补上新默认设置而不覆盖已有值。
+OLD_SCHEMA = """
+CREATE TABLE providers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '', base_url TEXT NOT NULL DEFAULT '',
+    api_key TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '',
+    temperature REAL, max_tokens INTEGER, extra_body TEXT
+);
+CREATE TABLE personas (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '',
+    voice TEXT NOT NULL DEFAULT '', tts_provider TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    user_text TEXT NOT NULL DEFAULT '',
+    answer TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    interrupted INTEGER NOT NULL DEFAULT 0,
+    provider_name TEXT NOT NULL DEFAULT '',
+    persona_name TEXT NOT NULL DEFAULT '',
+    web_sources TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX turns_ts ON turns (ts);
+"""
 
 
 class StoreTestCase(unittest.TestCase):
@@ -164,6 +193,101 @@ class StoreTestCase(unittest.TestCase):
         turns = store.recent_turns(10)
         self.assertEqual(turns[0]["ts"], 200)
         self.assertEqual(turns[0]["interrupted"], 1)
+
+    def test_new_turn_fields_roundtrip(self):
+        store = self.open_store()
+        store.add_turn("切换成毒舌", "好的，已切换为毒舌", "DeepSeek", "毒舌", "command",
+                       route="rule", intent_key="switch_target", rule_id=7,
+                       decision='{"confidence": 1.0}', learn_state="new")
+        turn = store.list_turns(0, 1)[0]
+        self.assertEqual((turn["route"], turn["intent_key"], turn["rule_id"], turn["learn_state"]),
+                         ("rule", "switch_target", 7, "new"))
+        self.assertEqual(turn["decision"], '{"confidence": 1.0}')
+        self.assertEqual(turn["corrected"], 0)
+
+    def test_migrates_old_turns_table(self):
+        conn = sqlite3.connect(self.path)
+        conn.executescript(OLD_SCHEMA)
+        conn.commit()
+        conn.close()
+        store = self.open_store()
+        cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(turns)")}
+        self.assertTrue({"route", "intent_key", "rule_id", "decision", "learn_state",
+                         "corrected"} <= cols)
+
+    def test_setting_descriptions_seeded_and_rendered(self):
+        # 新库与迁移后的旧库都要回填 description；已有非空 description 不被覆盖。
+        store = self.open_store()
+        self.assertEqual(store.get_setting_description("base_prompt"), SETTING_DESCRIPTIONS["base_prompt"])
+        self.assertEqual(store.get_setting_description("current_provider_id"), SETTING_DESCRIPTIONS["current_provider_id"])
+        self.assertIn("正整数", store.get_setting_description("context_gap_seconds"))
+        self.assertIn("百炼", store.get_setting_description("decision_provider_id"))
+        # 描述列落库（settings 表带 description 列）
+        cols = {r["name"] for r in store._conn.execute("PRAGMA table_info(settings)")}
+        self.assertIn("description", cols)
+
+    def test_setting_description_migrates_old_db(self):
+        # 旧 schema 的 settings 表没有 description 列：迁移补列并回填，已有值不覆盖。
+        old_path = os.path.join(self.tmpdir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(OLD_SCHEMA)
+        conn.commit()
+        conn.close()
+        store = Store(old_path)
+        self.stores.append(store)
+        self.assertEqual(store.get_setting_description("context_gap_seconds"),
+                         SETTING_DESCRIPTIONS["context_gap_seconds"])
+        self.assertEqual(store.get_setting("context_gap_seconds"), "300")
+
+    def test_setting_description_not_overwritten_when_present(self):
+        store = self.open_store()
+        store._execute(
+            "UPDATE settings SET description = ? WHERE `key` = ?", ("自定义说明", "base_prompt")
+        )
+        again = Store(self.path)
+        self.stores.append(again)
+        self.assertEqual(again.get_setting_description("base_prompt"), "自定义说明")
+
+    def test_seed_creates_intents_rules_capabilities(self):
+        store = self.open_store()
+        self.assertEqual([i["key"] for i in store.list_intents()],
+                         ["switch_target", "reset_context", "list_capabilities"])
+        self.assertEqual([(r["intent_key"], r["source"]) for r in store.list_rules()],
+                         [("reset_context", "manual"), ("switch_target", "manual")])
+        self.assertEqual(len(store.list_capabilities()), 3)
+
+    def test_defaults_added_to_existing_db(self):
+        old_path = os.path.join(self.tmpdir, "old.db")
+        conn = sqlite3.connect(old_path)
+        conn.executescript(OLD_SCHEMA)
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?)", ("current_persona_id", "3")
+        )
+        conn.commit()
+        conn.close()
+        store = Store(old_path)
+        self.stores.append(store)
+        self.assertEqual(store.get_setting("decision_timeout_ms"), "3000")
+        self.assertEqual(store.get_setting("current_persona_id"), "3")
+
+    def test_bump_rule_stats(self):
+        store = self.open_store()
+        rid = store.list_rules()[0]["id"]
+        store.bump_rule_stats(rid, hit=True, recheck=True, mismatch=True)
+        row = store.get_rule(rid)
+        self.assertEqual((row["hit_count"], row["recheck_count"], row["mismatch_count"]),
+                         (1, 1, 1))
+        self.assertIsNotNone(row["last_hit_ts"])
+
+    def test_deleted_manual_rule_not_reseeded(self):
+        # 审查发现：原 _seed_rules 按 pattern 判重、每次启动都播种 → 后台删掉的规则重启复活。
+        # 现在只在规则表为空时播种。
+        store = self.open_store()
+        rid = store.list_rules()[0]["id"]
+        store.delete_rule(rid)
+        again = Store(self.path)
+        self.stores.append(again)
+        self.assertEqual(len(again.list_rules()), 1)  # 只剩另一条，被删的不回来
 
 
 if __name__ == "__main__":

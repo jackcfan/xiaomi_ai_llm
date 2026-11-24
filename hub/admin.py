@@ -8,6 +8,7 @@ POST 做同源检查：Origin（缺失时看 Referer）的 host:port 与请求 H
 from __future__ import annotations
 
 import json
+import logging
 import math
 import secrets
 import time
@@ -21,6 +22,8 @@ from hub.store import Store
 from server.tts.edge_tts_client import VOICES
 from server.tts.siliconflow_tts import COSYVOICE_MODEL
 
+logger = logging.getLogger(__name__)
+
 PAGE_SIZE = 50
 # 性格的 TTS 服务提供方选项（值 → 后台显示名）。空串在表单里归一为 "edgetts"。
 TTS_ENGINE_CHOICES = (
@@ -28,6 +31,8 @@ TTS_ENGINE_CHOICES = (
     ("siliconflow", f"硅基流动 CosyVoice2（{COSYVOICE_MODEL}）"),
 )
 INT_SETTINGS = {"context_gap_seconds": "上下文间隔（秒）", "context_max_turns": "上下文最大轮数"}
+# 布尔开关（checkbox）：正则未命中后是否调用意图识别（决策模型）。关掉则直接按问答处理。
+BOOL_SETTINGS = {"decision_enabled": "意图识别（决策模型）"}
 ID_SETTINGS = {
     "current_provider_id": ("当前模型", "providers"),
     "fallback_provider_id": ("退回模型（设备直连兜底）", "providers"),
@@ -43,6 +48,7 @@ td,th{border:1px solid #ccc;padding:4px;vertical-align:top;text-align:left}
 input[type=text],textarea,select{width:100%;box-sizing:border-box}
 textarea{height:5em}
 .err{color:#b00;font-weight:bold}
+.hint{color:#666;font-size:0.85em;margin:2px 0}
 code{background:#eee;padding:2px 4px}
 """
 
@@ -62,7 +68,8 @@ def _page(title: str, body: str, status_code: int = 200) -> HTMLResponse:
         f"<!doctype html><html><head><meta charset='utf-8'><title>{_e(title)}</title>"
         f"<style>{CSS}</style></head><body>"
         "<nav><a href='/admin'>总览</a><a href='/admin/providers'>模型供应商</a>"
-        "<a href='/admin/personas'>性格</a><a href='/admin/history'>历史</a></nav>"
+        "<a href='/admin/personas'>性格</a><a href='/admin/history'>历史</a>"
+        "<a href='/admin/rules'>规则</a><a href='/admin/intents'>意图</a></nav>"
         f"<h1>{_e(title)}</h1>{body}</body></html>"
     )
     return HTMLResponse(html, status_code=status_code)
@@ -122,8 +129,11 @@ def _parse_extra_body(raw: str) -> tuple[str | None, str | None]:
     return json.dumps(value, ensure_ascii=False), None
 
 
-def make_admin_router(store: Store) -> APIRouter:
+def make_admin_router(store: Store, service=None) -> APIRouter:
     router = APIRouter(prefix="/admin", dependencies=[Depends(require_same_origin)])
+
+    def store_scope_service():
+        return service
 
     def rows_for(table: str) -> list[dict]:
         return store.list_providers() if table == "providers" else store.list_personas()
@@ -132,6 +142,11 @@ def make_admin_router(store: Store) -> APIRouter:
 
     def overview(errors: list[str] | None = None, status_code: int = 200) -> HTMLResponse:
         parts = [_errors_html(errors or []), "<form method='post' action='/admin'><table>"]
+
+        def hint_for(key: str) -> str:
+            desc = store.get_setting_description(key)
+            return f"<div class='hint'>{_e(desc)}</div>" if desc else ""
+
         for key, (label, table) in ID_SETTINGS.items():
             rows = rows_for(table)
             value = store.get_setting(key)
@@ -142,16 +157,24 @@ def make_admin_router(store: Store) -> APIRouter:
                 note = "（暂无可选项）"
             parts.append(
                 f"<tr><th>{_e(label)}</th><td><select name='{key}'>"
-                f"{_options(rows, value)}</select>{note}</td></tr>"
+                f"{_options(rows, value)}</select>{note}{hint_for(key)}</td></tr>"
             )
         for key, label in INT_SETTINGS.items():
             parts.append(
                 f"<tr><th>{_e(label)}</th><td><input type='text' name='{key}' "
-                f"value='{_e(store.get_setting(key, ''))}'></td></tr>"
+                f"value='{_e(store.get_setting(key, ''))}'>{hint_for(key)}</td></tr>"
+            )
+        for key, label in BOOL_SETTINGS.items():
+            checked = " checked" if store.get_setting(key, "1") == "1" else ""
+            parts.append(
+                f"<tr><th>{_e(label)}</th><td>"
+                f"<input type='hidden' name='{key}' value='0'>"
+                f"<input type='checkbox' name='{key}' value='1'{checked}> "
+                f"{hint_for(key)}</td></tr>"
             )
         parts.append(
             "<tr><th>基础提示词</th><td><textarea name='base_prompt'>"
-            f"{_e(store.get_setting('base_prompt', ''))}</textarea></td></tr>"
+            f"{_e(store.get_setting('base_prompt', ''))}</textarea>{hint_for('base_prompt')}</td></tr>"
             "</table><button type='submit'>保存</button></form>"
             "<h2>设备口令</h2><p>复制到音箱配置（X-Device-Token）：<code>"
             f"{_e(store.get_setting('device_token', ''))}</code></p>"
@@ -192,6 +215,9 @@ def make_admin_router(store: Store) -> APIRouter:
                 updates[key] = str(int(raw))
         if "base_prompt" in form:
             updates["base_prompt"] = str(form.get("base_prompt"))
+        for key in BOOL_SETTINGS:
+            if key in form:
+                updates[key] = "1" if str(form.get(key)) == "1" else "0"
         if errors:
             return overview(errors, 400)
         for key, value in updates.items():
@@ -363,18 +389,190 @@ def make_admin_router(store: Store) -> APIRouter:
         store.upsert_persona(data)
         return _redirect("/admin/personas")
 
+    # --- 决策规则与意图 --------------------------------------------------
+
+    @router.get("/rules", response_class=HTMLResponse)
+    def rules_get():
+        rules = store.list_rules()
+        rows = "".join(
+            "<tr>"
+            f"<td>{_e(r['intent_key'])}</td><td><code>{_e(r['pattern'])}</code></td>"
+            f"<td>{_e(r['source'])}</td><td>{_e(r['status'])}</td>"
+            f"<td>{_e(r['max_text_len'])}</td>"
+            f"<td>{_e(r['hit_count'])}/{_e(r['recheck_count'])}/{_e(r['mismatch_count'])}</td>"
+            f"<td><form method='post'><input type='hidden' name='id' value='{r['id']}'>"
+            f"<input type='hidden' name='action' value='toggle'>"
+            f"<input type='hidden' name='status' value='{'disabled' if r['status'] == 'active' else 'active'}'>"
+            f"<button>{'停用' if r['status'] == 'active' else '启用'}</button></form>"
+            f"<form method='post'><input type='hidden' name='id' value='{r['id']}'>"
+            f"<input type='hidden' name='action' value='delete'><button>删除</button></form></td>"
+            "</tr>"
+            for r in rules
+        )
+        body = (
+            "<p><a href='/admin/learn'>立即学习</a></p>"
+            "<table><tr><th>意图</th><th>模式</th><th>来源</th><th>状态</th><th>长度上限</th>"
+            f"<th>命中/复核/不一致</th><th>操作</th></tr>{rows}</table>"
+        )
+        return _page("决策规则", body)
+
+    @router.post("/rules")
+    async def rules_post(request: Request):
+        form = await request.form()
+        row_id = _parse_id(form.get("id"))
+        action = form.get("action")
+        if action == "delete":
+            if row_id is not None:
+                store.delete_rule(row_id)
+        elif action == "toggle":
+            status = str(form.get("status", "")).strip()
+            if row_id is not None and status in ("active", "disabled"):
+                store.upsert_rule({"id": row_id, "status": status})
+        return _redirect("/admin/rules")
+
+    @router.get("/intents", response_class=HTMLResponse)
+    def intents_get():
+        intents = store.list_intents()
+        rows = "".join(
+            "<tr><td>"
+            f"<form method='post'><input type='hidden' name='key' value='{_e(i['key'])}'>"
+            f"<td>{_e(i['key'])}</td>"
+            f"<td><input type='text' name='name' value='{_e(i['name'])}'></td>"
+            f"<td><input type='text' name='instructions' value='{_e(i['instructions'])}'></td>"
+            f"<td>{_e(i['param_kind'])}</td>"
+            f"<td><input type='hidden' name='enabled' value='{'0' if i['enabled'] else '1'}'>"
+            f"<button>{'停用' if i['enabled'] else '启用'}</button></form></td>"
+            "</tr>"
+            for i in intents
+        )
+        caps = "".join(
+            f"<li>{_e(c['name'])}（{_e(c['description'])}）{'· 已停用' if not c['enabled'] else ''}</li>"
+            for c in store.list_capabilities()
+        )
+        body = (
+            "<table><tr><th>key</th><th>名称</th><th>判定说明</th><th>参数</th><th>操作</th></tr>"
+            f"{rows}</table>"
+            f"<h3>能力清单</h3><ul>{caps}</ul>"
+        )
+        return _page("意图与能力", body)
+
+    @router.post("/intents")
+    async def intents_post(request: Request):
+        form = await request.form()
+        key = str(form.get("key", "")).strip()
+        intent = store.get_intent(key)
+        if intent is not None:
+            store.upsert_intent({
+                "key": key,
+                "name": str(form.get("name", "")).strip(),
+                "instructions": str(form.get("instructions", "")).strip(),
+                "param_kind": intent.get("param_kind", "none"),
+                "enabled": 1 if str(form.get("enabled", "1")) == "1" else 0,
+                "priority": intent.get("priority", 0),
+            })
+        return _redirect("/admin/intents")
+
+    # --- 学习任务 ---------------------------------------------------------
+
+    @router.get("/learn", response_class=HTMLResponse)
+    async def learn_get(request: Request):
+        from hub.learn import run_learning
+
+        async def generate(system, user):
+            import httpx
+            provider = store._current("providers", "learn_gen_provider_id") or store.current_provider()
+            if provider is None:
+                raise RuntimeError("no provider")
+            payload = {
+                "model": provider["model"],
+                "stream": False,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+            headers = {"Authorization": f"Bearer {provider['api_key']}"}
+            model = provider.get("model") or ""
+            base_url = (provider.get("base_url") or "").rstrip("/")
+            import logging
+            logging.getLogger("hub.app").info(
+                "[LEARN] 生成模型调用 name=%s model=%s base_url=%s",
+                provider.get("name"), model, base_url,
+            )
+            async with httpx.AsyncClient(timeout=60.0) as c:
+                r = await c.post(f"{base_url}/chat/completions",
+                                 json=payload, headers=headers)
+                logging.getLogger("hub.app").info(
+                    "[LEARN] 生成模型返回 status=%s name=%s model=%s",
+                    r.status_code, provider.get("name"), model,
+                )
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+
+        report = await run_learning(store, generate)
+        if report is None:
+            body = "<p class='err'>学习任务失败：生成模型返回无法解析。</p>"
+        else:
+            body = (
+                f"<p>扫描 {report.scanned} 条，提出 {report.proposed} 条，"
+                f"采纳 {report.accepted} 条，新增规则 {len(report.added_rule_ids)} 条。</p>"
+            )
+            if report.rejected:
+                rejected = "".join(
+                    f"<li>{_e(r['intent_key'])} / {_e(r['pattern'])} → {_e(r['reason'])}</li>"
+                    for r in report.rejected
+                )
+                body += f"<ul>{rejected}</ul>"
+        body += "<p><a href='/admin/rules'>返回规则列表</a></p>"
+        return _page("学习结果", body)
+
     # --- 历史 ------------------------------------------------------------
 
-    @router.get("/history", response_class=HTMLResponse)
-    def history(page: int = 1):
-        page = max(page, 1)
+    def _test_chat_html(message: str = "", reply: str = "", error: str = "") -> str:
+        parts = [
+            "<h2>测试聊天</h2>"
+            "<form method='post' action='/admin/history'>"
+            f"<input type='text' name='message' value='{_e(message)}' "
+            "placeholder='输入一句话，发起文本聊天' style='max-width:40em'> "
+            "<button type='submit'>发送</button></form>",
+        ]
+        if error:
+            parts.append(f"<p class='err'>{_e(error)}</p>")
+        elif reply:
+            parts.append(f"<p><b>问：</b>{_e(message)}</p><p><b>答：</b>{_e(reply)}</p>")
+        return "".join(parts)
+
+    def history_body(page: int, test_html: str = "") -> str:
         turns = store.list_turns((page - 1) * PAGE_SIZE, PAGE_SIZE + 1)
         has_next = len(turns) > PAGE_SIZE
+        # 决策路由相关新列：route（识别来源）/ intent_key（意图）/ learn_state（学习状态）/
+        # corrected（被纠正）/ decision（决策模型返回的置信度等 JSON）。
+        route_names = {"rule": "规则", "model": "决策", "none": "未识别", "": "-"}
+        learn_names = {"new": "待学习", "used": "已学习", "skipped": "跳过", "": "-"}
+
+        def _decision_brief(decision: str) -> str:
+            if not decision:
+                return ""
+            try:
+                data = json.loads(decision)
+            except ValueError:
+                return ""
+            conf = data.get("confidence")
+            if isinstance(conf, (int, float)):
+                return f"置信 {conf:.2f}"
+            return ""
+
         rows = "".join(
             "<tr>"
             f"<td>{_e(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(t['ts'])))}</td>"
             f"<td>{_e(t['user_text'])}</td><td>{_e(t['answer'])}</td>"
             f"<td>{_e(t['provider_name'])}</td><td>{_e(t['persona_name'])}</td>"
+            f"<td>{_e(route_names.get(t.get('route', ''), t.get('route', '')))}</td>"
+            f"<td>{_e(t.get('intent_key', '') or '')}</td>"
+            f"<td>{_e(learn_names.get(t.get('learn_state', ''), t.get('learn_state', '')))}</td>"
+            f"<td>{'是' if t.get('corrected') else ''}</td>"
+            f"<td>{_e(_decision_brief(t.get('decision', '')))}</td>"
             f"<td>{'是' if t['interrupted'] else ''}</td>"
             f"<td>{'是' if t['web_sources'] else ''}</td>"
             "</tr>"
@@ -387,10 +585,33 @@ def make_admin_router(store: Store) -> APIRouter:
         if has_next:
             nav.append(f"<a href='/admin/history?page={page + 1}'>下一页</a>")
         body = (
+            test_html +
             "<table><tr><th>时间</th><th>问题</th><th>回答</th><th>模型</th>"
-            f"<th>性格</th><th>打断</th><th>联网</th></tr>{rows}</table>"
+            "<th>性格</th><th>识别</th><th>意图</th><th>学习</th><th>纠正</th><th>置信度</th>"
+            f"<th>打断</th><th>联网</th></tr>{rows}</table>"
             f"<p>{' '.join(nav)}</p>"
         )
         return _page("历史记录", body)
+
+    @router.get("/history", response_class=HTMLResponse)
+    def history(page: int = 1):
+        page = max(page, 1)
+        return history_body(page, _test_chat_html())
+
+    @router.post("/history")
+    async def history_post(request: Request):
+        form = await request.form()
+        message = str(form.get("message", "")).strip()
+        if not message:
+            return history_body(1, _test_chat_html(error="请输入要发送的内容"))
+        service = store_scope_service()
+        if service is None:
+            return history_body(1, _test_chat_html(message, error="文本聊天服务不可用"))
+        try:
+            reply = await service.answer_text(message)
+        except Exception as exc:  # 任何失败都回到页面并显示错误，不抛 500
+            logger.warning("[ADMIN] test chat failed: %s", type(exc).__name__)
+            return history_body(1, _test_chat_html(message, error=f"发送失败：{type(exc).__name__}"))
+        return history_body(1, _test_chat_html(message, reply))
 
     return router

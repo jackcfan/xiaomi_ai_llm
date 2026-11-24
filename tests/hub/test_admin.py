@@ -59,11 +59,36 @@ class AdminTest(unittest.TestCase):
         self.assertIn("&lt;script&gt;", resp.text)
         self.assertNotIn("<script>", resp.text)
 
+    def test_history_page_has_test_chat_form(self):
+        # 回归：GET /admin/history 必须直接渲染出测试聊天表单（之前只传给 POST 分支）。
+        resp = self.client.get("/admin/history")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("测试聊天", resp.text)
+        self.assertIn("name='message'", resp.text)
+        self.assertIn("发送", resp.text)
+        self.assertIn("action='/admin/history'", resp.text)
+
     def test_context_settings_validated(self):
         resp = self.post("/admin", {"context_gap_seconds": "abc"})
         self.assertEqual(self.store.get_setting("context_gap_seconds"), "300")
         self.assertEqual(resp.status_code, 400)
         self.assertIn("context_gap_seconds", resp.text)
+
+    def test_decision_enabled_checkbox_toggles(self):
+        # 勾选 → "1"；不勾选（隐藏 input 提交 "0"）→ "0"。
+        self.assertEqual(self.store.get_setting("decision_enabled"), "1")
+        resp = self.post("/admin", {"decision_enabled": "0"})
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(self.store.get_setting("decision_enabled"), "0")
+        resp = self.post("/admin", {"decision_enabled": "1"})
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(self.store.get_setting("decision_enabled"), "1")
+
+    def test_overview_renders_decision_enabled_checkbox(self):
+        resp = self.client.get("/admin")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("name='decision_enabled'", resp.text)
+        self.assertIn("意图识别", resp.text)
 
     # --- extra coverage --------------------------------------------------
 
@@ -77,6 +102,13 @@ class AdminTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn(token, resp.text)
         self.assertIn("DeepSeek", resp.text)
+
+    def test_overview_shows_setting_descriptions(self):
+        resp = self.client.get("/admin")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("上下文间隔", resp.text)
+        self.assertIn("正整数", resp.text)  # 取值范围写进描述并渲染出来
+        self.assertIn("class='hint'", resp.text)
 
     def test_regenerate_device_token(self):
         old = self.store.get_setting("device_token")
@@ -268,6 +300,40 @@ class AdminTest(unittest.TestCase):
         second = self.client.get("/admin/history?page=2").text
         self.assertIn("问题04", second)
         self.assertNotIn("问题54", second)
+
+    # --- decision rules / intents pages ---------------------------------
+
+    def test_admin_rules_page_lists_rules(self):
+        body = self.client.get("/admin/rules").text
+        self.assertEqual(self.client.get("/admin/rules").status_code, 200)
+        self.assertIn("switch_target", body)
+        self.assertIn("manual", body)
+
+    def test_admin_can_disable_rule(self):
+        rid = self.store.list_rules()[0]["id"]
+        resp = self.post("/admin/rules", {"id": str(rid), "action": "toggle",
+                                          "status": "disabled"})
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(self.store.get_rule(rid)["status"], "disabled")
+
+    def test_admin_can_delete_rule(self):
+        rid = self.store.list_rules()[0]["id"]
+        self.post("/admin/rules", {"id": str(rid), "action": "delete"})
+        self.assertIsNone(self.store.get_rule(rid))
+
+    def test_admin_intents_page_renders(self):
+        body = self.client.get("/admin/intents").text
+        self.assertEqual(self.client.get("/admin/intents").status_code, 200)
+        self.assertIn("list_capabilities", body)
+        self.assertIn("切换角色或音色", body)
+
+    def test_admin_can_edit_intent_instructions(self):
+        resp = self.post("/admin/intents", {
+            "key": "reset_context", "name": "重置", "instructions": "新的判定说明",
+            "enabled": "1",
+        })
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(self.store.get_intent("reset_context")["instructions"], "新的判定说明")
 
 
 if __name__ == "__main__":

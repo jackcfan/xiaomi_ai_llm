@@ -1,5 +1,7 @@
 # 当前能力与验证范围
 
+**2026-11-24**：hub 命令识别改为**决策路由 + 规则自学习**三级链路（正则表 → 百炼 `decision-model-preview` 判定 → 普通问答），取代原 `commands.py` 两条硬编码正则。新增 `decision_rules` / `intents` / `capabilities` 三张表与 `turns` 路由列；意图集合封闭为「切换角色或模型 / 重置对话 / 列出能力」，能力必须注册 handler 才能播报。学习任务 `POST /api/v1/decision/learn`（设备口令保护）与后台 `/admin/rules`、`/admin/intents` 手动触发，把决策模型判过、正则没接住的样本蒸馏成新规则，规则经负例全集校验、长度上限（命中样本长 +6，夹 8~40）后入库，命中后抽样复核、不一致率达阈值自动停用。相关 hub 单测通过（未访问真实网络/真实决策接口），决策模型的真实识别效果与学习闭环待实机验收。见[测试说明](testing/2026-11-24-decision-routing.md)。
+
 **2026-11-23**：hub（NAS LLM hub，`python -m hub`）语音合成扩展为**可选的硅基流动 CosyVoice2**：每个性格新增「服务提供方」，默认仍是 EdgeTTS，选「硅基流动 CosyVoice2」时用 `personas.voice` 填 voice id，API key 存 `providers` 表（名称/别名含 `siliconflow` 的供应商），模型固定 `FunAudioLLM/CosyVoice2-0.5B`。请求 `wav`@32k 后走与 EdgeTTS 相同的 ffmpeg 响度归一化。相关 128 项单测通过（未访问真实网络/真实硅基流动服务），真实 CosyVoice2 出声与音箱响度、生产 MySQL 列迁移仍待实机验收。见[测试说明](testing/2026-11-23-hub-siliconflow-cosyvoice2.md)。
 
 **2026-11-06 · [PR #17](https://github.com/open-speaker-llm/xiaomi_ai_llm/pull/17) 已合并**：设备端流式 LLM 接管“咚咚”、搜索垫话“搜索中，请稍等。”、完整回答结束“咚”声，以及结束音后的 boot1 实时追问收音已实现；绿灯原本已有，首段垫话或正文播放时切换绿色跑马灯。PR 中有 boot1 真人复测记录，范围以该 PR 为准；boot0 同条件现场复验与长期稳定性仍待验收。开关见[配置参考](reference/configuration.md)。

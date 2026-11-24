@@ -200,7 +200,7 @@ def create_app(store: Store, service: ChatService | None = None) -> FastAPI:
     app = FastAPI(title="NAS LLM hub")
     app.state.store = store
     app.state.service = service
-    app.include_router(make_admin_router(store))
+    app.include_router(make_admin_router(store, service))
 
     @app.get("/")
     async def health():
@@ -252,6 +252,57 @@ def create_app(store: Store, service: ChatService | None = None) -> FastAPI:
             "api_key": provider["api_key"] or "",
             "model": provider["model"] or "",
             "system_prompt": f"{base_prompt}\n{persona_prompt}",
+        }
+
+    @app.post("/api/v1/decision/learn")
+    async def decision_learn(x_device_token: str = Header("")):
+        # 学习任务：设备口令保护，返回 JSON 摘要。
+        expected = store.get_setting("device_token") or ""
+        if not expected or not hmac.compare_digest(
+            x_device_token.encode("utf-8"), expected.encode("utf-8")
+        ):
+            raise HTTPException(status_code=403, detail="forbidden")
+
+        from hub.learn import run_learning
+
+        async def generate(system, user):
+            import httpx
+            provider = store._current("providers", "learn_gen_provider_id") or store.current_provider()
+            if provider is None:
+                raise RuntimeError("no provider")
+            payload = {
+                "model": provider["model"],
+                "stream": False,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            }
+            headers = {"Authorization": f"Bearer {provider['api_key']}"}
+            model = provider.get("model") or ""
+            base_url = (provider.get("base_url") or "").rstrip("/")
+            logger.info("[LEARN] 生成模型调用 name=%s model=%s base_url=%s",
+                        provider.get("name"), model, base_url)
+            async with httpx.AsyncClient(timeout=60.0) as c:
+                r = await c.post(
+                    f"{base_url}/chat/completions",
+                    json=payload, headers=headers,
+                )
+                logger.info("[LEARN] 生成模型返回 status=%s name=%s model=%s",
+                            r.status_code, provider.get("name"), model)
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"]
+
+        report = await run_learning(store, generate)
+        if report is None:
+            raise HTTPException(status_code=500, detail="learning failed: unparseable model output")
+        return {
+            "scanned": report.scanned,
+            "proposed": report.proposed,
+            "accepted": report.accepted,
+            "rejected": report.rejected,
+            "added_rule_ids": report.added_rule_ids,
         }
 
     return app

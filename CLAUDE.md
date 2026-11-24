@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+## 强制约束（违反即错）
+
+- **禁止**自动执行 `git add` / `git commit` / `git push`——用户明确说”帮我提交”才执行
 
 ## 项目定位
 

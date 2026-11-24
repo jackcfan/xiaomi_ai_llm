@@ -159,6 +159,33 @@ class ChatClientTest(unittest.IsolatedAsyncioTestCase):
         await gen.aclose()
         self.assertTrue(stream.closed)
 
+    async def test_logs_model_call_and_done_status(self):
+        def handler(request):
+            return httpx.Response(200, content=sse("hi", "。"))
+
+        client = ChatClient("https://api.example.com/v1", "k", "m1",
+                            transport=httpx.MockTransport(handler))
+        with self.assertLogs("hub.llm", "INFO") as logs:
+            [t async for t in client.chat_stream(message="hello")]
+        out = "\n".join(logs.output)
+        self.assertIn("call model=m1", out)
+        self.assertIn("done model=m1", out)
+        self.assertIn("status=200", out)
+        self.assertIn("chars=3", out)  # "hi。" 共 3 字符
+
+    async def test_logs_model_on_http_error(self):
+        def handler(request):
+            return httpx.Response(401, text="bad key sk-secret")
+
+        client = ChatClient("https://api.example.com/v1", "sk-secret", "m2",
+                            transport=httpx.MockTransport(handler))
+        with self.assertLogs("hub.llm", "WARNING") as logs:
+            with self.assertRaises(LLMError):
+                [t async for t in client.chat_stream(message="hi")]
+        out = "\n".join(logs.output)
+        self.assertIn("m2", out)
+        self.assertNotIn("sk-secret", out)
+
 
 if __name__ == "__main__":
     unittest.main()

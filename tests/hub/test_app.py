@@ -147,6 +147,45 @@ class HubAppTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json(), {"status": "ok"})
 
+    def test_admin_test_chat_streams_text_answer(self):
+        # /admin/history 测试聊天入口：文本聊天走 answer_text，不合成音频。
+        resp = self.client.post("/admin/history", data={"message": "世界首富是谁"},
+                                follow_redirects=False)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("世界首富是谁", resp.text)
+        self.assertIn(FULL_ANSWER, resp.text)
+        self.assertIn("测试聊天", resp.text)
+        # 完整回答落库（非流式，不被打断）。
+        turn = self.store.recent_turns(1)[0]
+        self.assertEqual(turn["kind"], "qa")
+        self.assertEqual(turn["answer"], FULL_ANSWER)
+        self.assertEqual(self.llm.calls[0]["message"], "世界首富是谁")
+
+    def test_admin_test_chat_empty_message_rejected(self):
+        resp = self.client.post("/admin/history", data={"message": "   "},
+                                follow_redirects=False)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("请输入要发送的内容", resp.text)
+        self.assertEqual(self.llm.calls, [])
+
+    def test_admin_test_chat_escapes_html(self):
+        # 页面上的输入与回复都要转义，历史表本身也已转义。
+        self.llm.tokens = ["<b>加粗</b>。"]
+        resp = self.client.post("/admin/history", data={"message": "<script>x</script>"},
+                                follow_redirects=False)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("&lt;script&gt;", resp.text)
+        self.assertNotIn("<script>", resp.text)
+        self.assertIn("&lt;b&gt;加粗&lt;/b&gt;", resp.text)
+
+    def test_admin_test_chat_failure_shows_error(self):
+        self.llm.error = RuntimeError("boom")
+        with self.assertLogs("hub.admin", "WARNING"):
+            resp = self.client.post("/admin/history", data={"message": "世界首富是谁"},
+                                    follow_redirects=False)
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("发送失败", resp.text)
+
     def test_text_chat_streams_wav_and_saves_turn(self):
         resp = self.ask("世界首富是谁")
         self.assertEqual(resp.status_code, 200)
@@ -465,6 +504,46 @@ class HubAppTest(unittest.TestCase):
         self.store.set_setting("current_persona_id", str(pid))
         with self.assertRaises(ChatError):
             self.service._make_tts(self.store.current_persona())
+
+    def test_learn_endpoint_requires_token(self):
+        resp = self.client.post("/api/v1/decision/learn")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_learn_endpoint_returns_report(self):
+        token = self.store.get_setting("device_token")
+        resp = self.client.post("/api/v1/decision/learn",
+                                headers={"X-Device-Token": token})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(set(resp.json()),
+                         {"scanned", "proposed", "accepted", "rejected", "added_rule_ids"})
+
+    def test_learn_endpoint_passes_async_generator(self):
+        # 回归审查发现的 Critical：generate 曾是 sync 函数在事件循环里 asyncio.run → 500。
+        # 这里验证 endpoint 传给 run_learning 的 generate 是 async 可 await 的。
+        import inspect
+        from unittest import mock
+
+        self.store.add_turn("角色切换到银月", "答", "DeepSeek", "默认", "command",
+                            route="model", intent_key="switch_target", learn_state="new")
+        token = self.store.get_setting("device_token")
+        captured = {}
+
+        async def fake_run_learning(store, generate, max_samples=200):
+            captured["generate"] = generate
+            from hub.learn import LearnReport
+            return LearnReport(scanned=0)
+
+        import hub.learn as learn_mod
+        with mock.patch.object(learn_mod, "run_learning", side_effect=fake_run_learning):
+            resp = self.client.post("/api/v1/decision/learn",
+                                    headers={"X-Device-Token": token})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(inspect.iscoroutinefunction(captured["generate"]))
+
+    def test_learn_endpoint_bad_token_forbidden(self):
+        resp = self.client.post("/api/v1/decision/learn",
+                                headers={"X-Device-Token": "wrong"})
+        self.assertEqual(resp.status_code, 403)
 
 
 if __name__ == "__main__":

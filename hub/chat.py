@@ -11,14 +11,18 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
+import re
 import time
+from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 import anyio
 
-from hub.commands import parse_command
 from hub.context import select_context
+from hub.intents import INTENT_KEYS, execute as execute_intent
 from hub.llm import ChatClient
+from hub.rules import load_ruleset, normalize
 from hub.store import Store
 from hub.web import ground
 from server.streaming_pipeline import StreamingPipeline
@@ -38,6 +42,17 @@ SILICONFLOW_ENGINE = "siliconflow"
 # 模型流失败为 "LLM: ..."，单句 TTS 失败为 "TTS: ..."。那里的文案改动时需同步这里。
 PIPELINE_LLM_ERROR = "LLM:"
 PIPELINE_TTS_ERROR = "TTS:"
+
+
+@dataclass
+class Route:
+    """一次请求的路由决策结果：识别来源（rule/model/none）与可执行参数。"""
+
+    route: str = "none"
+    intent_key: str = ""
+    rule_id: int | None = None
+    params: dict = field(default_factory=dict)
+    decision: dict = field(default_factory=dict)
 
 
 class ChatError(RuntimeError):
@@ -65,6 +80,40 @@ def _int_setting(value: str | None, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+def _float_setting(value: str | None, default: float) -> float:
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+_THINK_START = re.compile(r"<\s*think\s*>", re.IGNORECASE)
+_THINK_END = re.compile(r"<\s*/\s*think\s*>", re.IGNORECASE)
+
+
+def _strip_think_tokens(tokens) -> str:
+    """拼接模型 token 流并去掉 <think>…</think> 思考段。
+
+    非流式场景下全文已齐，用正则切掉思考段即可；未闭合的 <think> 连后面一起丢弃，
+    与 StreamingPipeline 流结束时的行为一致（思考段未结束则剩余缓冲不输出）。
+    """
+    text = "".join(tokens)
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        start = _THINK_START.search(text, i)
+        if start is None:
+            out.append(text[i:])
+            break
+        out.append(text[i:start.start()])
+        end = _THINK_END.search(text, start.end())
+        if end is None:
+            break  # 未闭合的思考段：丢弃其后全部内容
+        i = end.end()
+    return "".join(out)
+
+
 class _TrackedLLM:
     """包装 LLM 客户端，记下 chat_stream 生成器以便断开时显式 aclose。
 
@@ -88,12 +137,16 @@ class ChatService:
         tts_factory=edge_tts_factory,
         web_ground=ground,
         clock=time.time,
+        decision=None,
     ):
         self.store = store
         self.llm_factory = llm_factory
         self.tts_factory = tts_factory
         self.web_ground = web_ground
         self.clock = clock
+        self.decision = decision  # 可注入；生产默认 hub.decision.decide（Task 7 起使用）
+        self._pending: tuple[float, Route] | None = None  # (到期时间戳, 待确认 route)
+        self._last_command: tuple[float, str, dict, int] | None = None
         # 垫话 PCM 缓存：(engine, voice, speed, volume) -> PCM 块列表，避免每次搜索重复合成。
         self._filler_cache: dict[tuple, list[bytes]] = {}
 
@@ -210,38 +263,283 @@ class ChatService:
                 yield pcm
 
     async def answer(self, text: str, speed: float, volume: float) -> AsyncIterator[bytes]:
-        provider, persona = self._current()
-        command = parse_command(text, self.store.list_personas(), self.store.list_providers())
-        if command is not None:
-            inner = self._run_command(text, command, speed, volume)
+        norm = normalize(text)
+        # 待确认命令的后续确认（「对/是/嗯」），30 秒内有效，hub 全局。
+        pending = self._take_pending(norm)
+        if pending is not None:
+            audio, _turn_id = await self._run_intent(pending, text, speed, volume)
+            async with contextlib.aclosing(audio) as agen:
+                async for pcm in agen:
+                    yield pcm
+            return
+        # 纠正检测先于路由：上一条命令可能被「不对/不是/我说的是/搞错」纠正，
+        # 而纠正短语本身往往又被判成命令（如「不对，是温柔」→ switch_target）。
+        self._maybe_mark_correction(norm)
+        route = await self._route(text)
+        if route.intent_key and route.intent_key != "qa":
+            # 低置信确认带：模型拿不准时不执行，播确认、记 _pending。
+            confirm = self._needs_confirm(route)
+            if confirm:
+                inner = self._confirm_ask(route, text, speed, volume)
+            else:
+                inner, turn_id = await self._run_intent(route, text, speed, volume)
+                if turn_id is not None:
+                    self._last_command = (self.clock(), route.intent_key,
+                                          (route.params.get("entity") or {}).get("name"), turn_id)
+                self._maybe_recheck(norm, route)  # 规则命中后抽样复核
         else:
-            inner = self._qa(text, provider, persona, speed, volume)
+            provider, persona = self._current()
+            inner = self._qa(text, provider, persona, speed, volume, route=route)
         # aclosing：answer 被关闭时立即关闭内层生成器，使其 finally（落库、关模型流）
         # 同步执行完，而不是留给 asyncio 的 asyncgen 终结器。
         async with contextlib.aclosing(inner) as audio:
             async for pcm in audio:
                 yield pcm
 
-    async def _run_command(self, text, command, speed, volume) -> AsyncIterator[bytes]:
-        if command.kind == "persona":
-            self.store.set_setting("current_persona_id", str(command.target_id))
-            reply, kind = f"好的，已切换为{command.target_name}", "command"
-        elif command.kind == "provider":
-            self.store.set_setting("current_provider_id", str(command.target_id))
-            reply, kind = f"好的，已切换到{command.target_name}", "command"
-        else:
-            reply, kind = "好的，我们重新开始", "reset"
-        provider, persona = self._current()  # 切换后的音色/名称
-        logger.info("[CMD] %s -> %s", command.kind, command.target_name or "-")
+    async def answer_text(self, text: str) -> str:
+        """文本聊天（/admin/history 测试入口用）：与 answer 相同的路由/意图，但不合成音频。"""
+        norm = normalize(text)
+        pending = self._take_pending(norm)
+        if pending is not None:
+            reply, _turn_id = await self._run_intent_text(pending, text)
+            return reply
+        self._maybe_mark_correction(norm)
+        route = await self._route(text)
+        if route.intent_key and route.intent_key != "qa":
+            if self._needs_confirm(route):
+                return self._confirm_ask_text(route, text)
+            reply, turn_id = await self._run_intent_text(route, text)
+            if turn_id is not None:
+                self._last_command = (self.clock(), route.intent_key,
+                                      (route.params.get("entity") or {}).get("name"), turn_id)
+            return reply
+        provider, persona = self._current()
+        return await self._qa_text(text, provider, persona, route)
+
+    def _take_pending(self, norm: str) -> Route | None:
+        if self._pending is None:
+            return None
+        expires, route = self._pending
+        self._pending = None
+        if norm not in ("对", "是", "嗯", "好", "可以", "没错"):
+            return None
+        if self.clock() > expires:
+            return None
+        return route
+
+    def _needs_confirm(self, route: Route) -> bool:
+        if not _int_setting(self.store.get_setting("decision_confirm_band"), 1):
+            return False
+        if not route.params.get("entity"):
+            return False  # 确认带只适用于有实体的意图（切换），避免「你是要切换到吗」
+        conf = float(route.decision.get("confidence") or 0.0)
+        min_conf = _float_setting(self.store.get_setting("decision_min_confidence"), 0.6)
+        return route.route == "model" and min_conf <= conf < 0.75
+
+    def _confirm_ask(self, route: Route, text, speed, volume) -> AsyncIterator[bytes]:
+        name = (route.params.get("entity") or {}).get("name", "")
+        reply = f"你是要切换到{name}吗"
+        provider, persona = self._current()
+        self._pending = (self.clock() + 30, route)
         self.store.add_turn(
-            text, reply, provider["name"], persona["name"], kind, ts=self.clock()
+            text, reply, provider["name"], persona["name"], "command",
+            route=route.route, intent_key=route.intent_key, rule_id=route.rule_id,
+            decision=json.dumps(route.decision, ensure_ascii=False) if route.decision else "",
+            learn_state="new", ts=self.clock(),
         )
         tts = self._make_tts(persona)
-        async with contextlib.aclosing(self._tts_pcm(tts, reply, speed, volume)) as audio:
-            async for pcm in audio:
-                yield pcm
+        return self._tts_pcm(tts, reply, speed, volume)
 
-    async def _qa(self, text, provider, persona, speed, volume) -> AsyncIterator[bytes]:
+    def _confirm_ask_text(self, route: Route, text: str) -> str:
+        name = (route.params.get("entity") or {}).get("name", "")
+        reply = f"你是要切换到{name}吗"
+        provider, persona = self._current()
+        self._pending = (self.clock() + 30, route)
+        self.store.add_turn(
+            text, reply, provider["name"], persona["name"], "command",
+            route=route.route, intent_key=route.intent_key, rule_id=route.rule_id,
+            decision=json.dumps(route.decision, ensure_ascii=False) if route.decision else "",
+            learn_state="new", ts=self.clock(),
+        )
+        return reply
+
+    def _maybe_mark_correction(self, norm: str) -> None:
+        """纠正检测：上一条命令后 60 秒内，若下一条话匹配纠正词，把上一条标记 corrected。"""
+        if self._last_command is None:
+            return
+        ts, intent_key, entity_name, turn_id = self._last_command
+        self._last_command = None
+        if self.clock() - ts > 60 or turn_id == -1:
+            return
+        if norm.startswith(("不对", "不是", "我说的是", "搞错")):
+            self.store.set_turn_corrected(turn_id)
+            logger.info("[CHAT] correction detected for turn %s", turn_id)
+
+    def _maybe_recheck(self, norm: str, route: Route) -> "asyncio.Task | None":
+        """规则命中后抽样调决策模型复核；返回启动的任务（fire-and-forget），不一致累加 mismatch。"""
+        if route.route != "rule":
+            return None
+        rule = self.store.get_rule(route.rule_id)
+        if rule is None:
+            return None
+        ratio = _float_setting(self.store.get_setting("decision_recheck_ratio"), 0.05)
+        if rule.get("source") == "learned" and (rule.get("hit_count") or 0) < 50:
+            ratio = 0.2
+        if random.random() >= ratio:
+            return None
+        client = self._decision_client()
+        if client is None:
+            return None
+
+        async def do_recheck():
+            try:
+                from hub.decision import decide
+                d = await decide(
+                    norm, self.store, client,
+                    _float_setting(self.store.get_setting("decision_timeout_ms"), 800) / 1000,
+                    _float_setting(self.store.get_setting("decision_min_confidence"), 0.6),
+                )
+                got = d.intent_key if d is not None else "qa"
+                mismatch = got != route.intent_key
+                self.store.bump_rule_stats(route.rule_id, recheck=True, mismatch=mismatch)
+                if mismatch:
+                    self._maybe_disable_rule(route.rule_id)
+            except Exception as exc:
+                logger.warning("[CHAT] recheck failed: %s", type(exc).__name__)
+
+        return asyncio.ensure_future(do_recheck())
+
+    def _maybe_disable_rule(self, rule_id: int) -> bool:
+        """复核不一致率达到阈值时停用规则；返回是否停用。"""
+        row = self.store.get_rule(rule_id)
+        if not row:
+            return False
+        recheck = row.get("recheck_count") or 0
+        mismatch = row.get("mismatch_count") or 0
+        if recheck >= 10 and mismatch / recheck >= 0.25:
+            self.store.upsert_rule({"id": rule_id, "status": "disabled"})
+            logger.warning("[CHAT] rule %s auto-disabled after recheck mismatches", rule_id)
+            return True
+        return False
+
+    async def _route(self, text: str) -> Route:
+        """三级路由：正则表（rule）→ 决策模型（model）→ 未命中（none）。
+
+        model 表示决策模型确实被调用过（结论可能是命令或 qa）；none 表示没调
+        （正则未命中且被闸门/开关拦下、或决策异常）。intent_key == qa 表示模型判成问答。
+        """
+        norm = normalize(text)
+        hit = load_ruleset(self.store).match(norm)
+        if hit is not None:
+            self.store.bump_rule_stats(hit.rule.id, hit=True)
+            return Route(
+                route="rule",
+                intent_key=hit.rule.intent_key,
+                rule_id=hit.rule.id,
+                params={"entity": hit.entity} if hit.entity else {},
+            )
+
+        if not norm:  # 只有标点/只有唤醒词：不走决策模型，直接问答
+            return Route()
+
+        if not _int_setting(self.store.get_setting("decision_enabled"), 1):
+            return Route()
+        gate_len = _int_setting(self.store.get_setting("decision_gate_len"), 40)
+        if len(norm) > gate_len:
+            return Route()
+
+        if self.decision is None:
+            from hub.decision import decide as _decide
+            self.decision = _decide
+
+        client = self._decision_client()
+        if client is None:
+            logger.warning("[CHAT] decision provider not configured, skip decision")
+            return Route()
+
+        budget_s = _float_setting(self.store.get_setting("decision_timeout_ms"), 800) / 1000
+        min_conf = _float_setting(self.store.get_setting("decision_min_confidence"), 0.6)
+        from hub.decision import DecisionOut
+
+        out = DecisionOut()
+        try:
+            decision = await self.decision(norm, self.store, client, budget_s, min_conf, out)
+        except Exception as exc:  # 决策异常绝不打断主链路
+            logger.warning("[CHAT] decision failed: %s", type(exc).__name__)
+            return Route()
+
+        if decision is None:
+            # 模型调过、判成 qa 或不确定：intent_key 记 qa，学习任务据此取负例。
+            # 阶段一原始判定带进 decision，落库后便于诊断「为什么判成 qa」。
+            raw = out.intent or {}
+            if out.entity_failed:
+                raw = {**raw, "entity_failed": True}
+            return Route(route="model", intent_key="qa", decision=raw)
+        return Route(
+            route="model",
+            intent_key=decision.intent_key,
+            params={"entity": decision.entity} if decision.entity else {},
+            decision={
+                "confidence": decision.confidence,
+                "probabilities": decision.probabilities,
+                **(out.intent or {}),
+                **({"entity_failed": True} if out.entity_failed else {}),
+            },
+        )
+
+    def _decision_client(self):
+        provider_id = self.store.get_setting("decision_provider_id")
+        if provider_id and provider_id.isdecimal():
+            provider = self.store.get_provider(int(provider_id))
+            if provider and (provider.get("base_url") or "").strip():
+                from hub.decision import DecisionClient
+                return DecisionClient(
+                    base_url=provider["base_url"],
+                    api_key=provider.get("api_key") or "",
+                    model=provider.get("model") or "decision-model-preview",
+                )
+        return None
+
+    async def _run_intent(self, route: Route, text, speed, volume):
+        if route.intent_key not in INTENT_KEYS:
+            # 规则/意图表里的未知 key 绝不执行（spec §5.1）；当作未命中回落问答。
+            logger.warning("[CHAT] unknown intent key %s ignored", route.intent_key)
+            provider, persona = self._current()
+            audio = self._qa(text, provider, persona, speed, volume, route=route)
+            return audio, None
+        entity = route.params.get("entity")
+        reply, kind = execute_intent(self.store, route.intent_key, entity or {})
+        provider, persona = self._current()
+        logger.info("[CMD] %s -> %s", route.intent_key, (entity or {}).get("name") or "-")
+        turn_id = self.store.add_turn(
+            text, reply, provider["name"], persona["name"], kind,
+            route=route.route, intent_key=route.intent_key, rule_id=route.rule_id,
+            decision=json.dumps(route.decision, ensure_ascii=False) if route.decision else "",
+            learn_state="new", ts=self.clock(),
+        )
+        tts = self._make_tts(persona)
+        audio = self._tts_pcm(tts, reply, speed, volume)
+        return audio, turn_id
+
+    async def _run_intent_text(self, route: Route, text: str) -> tuple[str, int | None]:
+        if route.intent_key not in INTENT_KEYS:
+            logger.warning("[CHAT] unknown intent key %s ignored", route.intent_key)
+            provider, persona = self._current()
+            return await self._qa_text(text, provider, persona, route), None
+        entity = route.params.get("entity")
+        reply, kind = execute_intent(self.store, route.intent_key, entity or {})
+        provider, persona = self._current()
+        logger.info("[CMD] %s -> %s", route.intent_key, (entity or {}).get("name") or "-")
+        turn_id = self.store.add_turn(
+            text, reply, provider["name"], persona["name"], kind,
+            route=route.route, intent_key=route.intent_key, rule_id=route.rule_id,
+            decision=json.dumps(route.decision, ensure_ascii=False) if route.decision else "",
+            learn_state="new", ts=self.clock(),
+        )
+        return reply, turn_id
+
+    async def _qa(self, text, provider, persona, speed, volume, route: Route | None = None) -> AsyncIterator[bytes]:
+        route = route or Route()
         context = self._context()
         tts = self._make_tts(persona)
         audio_started = False  # 已向调用方产出过任何 PCM（含垫话）
@@ -261,6 +559,9 @@ class ChatService:
             self.store.add_turn(
                 text, answer_text, provider["name"], persona["name"], "qa",
                 web_sources=sources, interrupted=was_interrupted, ts=self.clock(),
+                route=route.route, intent_key=route.intent_key, rule_id=route.rule_id,
+                decision=json.dumps(route.decision, ensure_ascii=False) if route.decision else "",
+                learn_state="skipped" if route.route == "none" else "new",
             )
             saved = True
 
@@ -345,5 +646,54 @@ class ChatService:
                             await task
                 if events is not None:
                     await events.aclose()
+                if llm.stream is not None:
+                    await llm.stream.aclose()
+
+    async def _qa_text(self, text: str, provider: dict, persona: dict, route: Route | None = None) -> str:
+        """纯文本 QA：与 _qa 相同的联网检索与 LLM 调用，但不合成音频，返回全文。"""
+        route = route or Route()
+        context = self._context()
+        sources = ""
+        llm = _TrackedLLM(self._make_llm(provider))
+        ground_task = None
+        tool_wait = None
+        try:
+            tool_started = asyncio.Event()
+            ground_task = asyncio.ensure_future(self.web_ground(
+                text, context, self._search_provider(provider), on_tool_start=tool_started.set,
+            ))
+            tool_wait = asyncio.ensure_future(tool_started.wait())
+            await asyncio.wait({ground_task, tool_wait}, return_when=asyncio.FIRST_COMPLETED)
+            web = await ground_task
+            sources = "\n".join(web.sources or [])
+            if web.action in ("search", "fetch") and len(web.evidence_messages) >= 2:
+                history = context + [{"role": "user", "content": text}, web.evidence_messages[0]]
+                message = web.evidence_messages[1]["content"]
+            else:
+                history = context
+                message = text
+            tokens = []
+            async for token in llm.chat_stream(
+                message=message,
+                system_prompt=self._system_prompt(persona),
+                conversation_history=history,
+            ):
+                tokens.append(token)
+            answer = _strip_think_tokens(tokens)
+            self.store.add_turn(
+                text, answer, provider["name"], persona["name"], "qa",
+                web_sources=sources, interrupted=False, ts=self.clock(),
+                route=route.route, intent_key=route.intent_key, rule_id=route.rule_id,
+                decision=json.dumps(route.decision, ensure_ascii=False) if route.decision else "",
+                learn_state="skipped" if route.route == "none" else "new",
+            )
+            return answer
+        finally:
+            with anyio.CancelScope(shield=True):
+                for task in (tool_wait, ground_task):
+                    if task is not None and not task.done():
+                        task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await task
                 if llm.stream is not None:
                     await llm.stream.aclose()
